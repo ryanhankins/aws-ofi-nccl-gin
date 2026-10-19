@@ -137,6 +137,9 @@ private:
 	int gin_process_completions(struct fi_cq_data_entry *cq_entry, fi_addr_t *src_addrs,
 				    uint64_t num_cqes, uint16_t rail_id);
 
+	int dispatch_via_op_context(struct fi_cq_data_entry *cq_entry, fi_addr_t src_addr,
+				    uint16_t rail_id);
+
 	/**
 	 * CQ error entry handler
 	 */
