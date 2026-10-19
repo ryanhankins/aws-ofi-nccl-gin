@@ -261,7 +261,34 @@ int nccl_net_ofi_gin_write_req_t::post()
 	msg.context = &ctx.ofi_ctx;
 	msg.data = imm_data;
 
-	ssize_t rc = fi_writemsg(ep, &msg, flags);
+	ssize_t rc;
+	if (endpoint_mr) {
+		/* Endpoint-MR providers (CXI) do not accept FI_REMOTE_CQ_DATA in
+		   fi_writemsg flags; remote CQ data goes through fi_writedata
+		   (requires FI_CXI_ENABLE_WRITEDATA=1). */
+		/* fi_writedata() takes no per-op flags and posts with the endpoint's
+		   default transmit flags. To defer the doorbell (FI_MORE) so it is
+		   batched with the metadata send that follows, set FI_MORE on the
+		   endpoint for just this call and restore it afterwards (other ops,
+		   e.g. fi_read, also read these defaults). Caller holds the ep lock. */
+		const bool more = (flags & FI_MORE) != 0;
+		uint64_t cur = FI_TRANSMIT;
+		bool restore = false;
+		if (more && fi_control(&ep->fid, FI_GETOPSFLAG, &cur) == 0) {
+			/* Keep the existing flags (notably FI_COMPLETION): SETOPSFLAG
+			   replaces them wholesale. */
+			uint64_t with_more = cur | FI_TRANSMIT | FI_MORE;
+			cur |= FI_TRANSMIT;
+			restore = (fi_control(&ep->fid, FI_SETOPSFLAG, &with_more) == 0);
+		}
+		rc = fi_writedata(ep, src, size, desc, imm_data, remote_addr, dest, key,
+				  &ctx.ofi_ctx);
+		if (restore) {
+			(void)fi_control(&ep->fid, FI_SETOPSFLAG, &cur);
+		}
+	} else {
+		rc = fi_writemsg(ep, &msg, flags);
+	}
 
 	/* Drop FI_MORE for retry — must not remain pending in the queue */
 	flags &= ~FI_MORE;

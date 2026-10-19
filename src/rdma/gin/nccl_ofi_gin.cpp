@@ -350,6 +350,12 @@ int nccl_ofi_rdma_gin_put_comm::regMrSymLocal(nccl_ofi_mr_ckey_ref ckey, void *d
 
 	NCCL_OFI_TRACE(NCCL_NET, "regMrSymDmaBuf ptr %p size %zu type %d handle %p",
 		       data_ptr, size, type, mr_handle);
+	NCCL_OFI_TRACE(NCCL_NET,
+		       "GIN symmetric MR ptr %p size %zu type %d ckey %s "
+		       "base %p len %zu align_off %zu",
+		      data_ptr, size, type, nccl_ofi_mr_ckey_type_str(ckey),
+		      (void *)nccl_ofi_mr_ckey_baseaddr(ckey), (size_t)nccl_ofi_mr_ckey_len(ckey),
+		      (size_t)((uintptr_t)data_ptr % mr_cache_alignment));
 
 	/**
 	 * Local registration with the endpoint
@@ -563,6 +569,9 @@ int nccl_ofi_rdma_gin_put_comm::await_pending_requests()
  * Other providers keep the full sequence window. */
 #define GIN_EQ_EVENT_BUDGET 384
 #define GIN_MIN_TX_WINDOW 32
+
+/* Smallest write that shares its doorbell with the paired metadata send (CXI) */
+#define GIN_CXI_PAIR_DOORBELL_MIN (64 * 1024)
 
 static inline uint32_t gin_tx_window(int nranks)
 {
@@ -816,8 +825,15 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 			   deferring, to batch with the next op on the pinned rail. A striped
 			   op never defers, so it rings per stripe. */
 			uint64_t wr_flags = FI_REMOTE_CQ_DATA;
-			if ((has_signal && rail_it == 0) || defer)
+			/* On endpoint-MR providers (CXI) pairing the write's doorbell with the
+			   metadata send's costs ~0.8 us of put_signal latency but speeds up
+			   large writes substantially (single-context alltoall, ~+45%), so only
+			   pair for large writes there. */
+			const bool pair_with_send = has_signal && rail_it == 0 &&
+				(!endpoint_mr || xfer_info->msg_size >= GIN_CXI_PAIR_DOORBELL_MIN);
+			if (pair_with_send || defer) {
 				wr_flags |= FI_MORE;
+			}
 
 			auto write_req = get_resources().get_req_from_pool<nccl_net_ofi_gin_write_req_t>(
 				gin_ep.get_rail(rail).ofi_ep.get(),
