@@ -34,20 +34,22 @@ nccl_ofi_gin_resources_registry::get(const std::shared_ptr<nccl_net_ofi_ep_t> &e
 
 	auto it = by_ep.find(ep.get());
 	if (it != by_ep.end()) {
-		if (auto existing = it->second.lock()) {
+		if (auto existing = it->second.resource.lock()) {
+			existing->maybe_warn_cq_sizing_mismatch(nranks);
 			return existing;
 		}
 	}
 
 	auto resources = std::make_shared<nccl_ofi_gin_resources>(ep, nranks);
-	by_ep[ep.get()] = resources;
+	by_ep[ep.get()] = {resources.get(), resources};
 	return resources;
 }
 
-void nccl_ofi_gin_resources_registry::release(nccl_net_ofi_ep_t *ep)
+void nccl_ofi_gin_resources_registry::release(nccl_net_ofi_ep_t *ep,
+						      nccl_ofi_gin_resources *resource)
 {
 	std::lock_guard<std::mutex> guard(lock);
-	by_ep.erase(ep);
+	gin_registry_erase_if_same_resource(by_ep, ep, resource);
 }
 
 nccl_ofi_gin_resources_registry &gin_resources_registry()
@@ -738,10 +740,6 @@ void nccl_ofi_gin_resources::release()
 {
 	assert_always(this->ref_cnt > 0);
 	this->ref_cnt--;
-	if (this->ref_cnt == 0) {
-		delete this;
-		return;
-	}
 	refresh_shared_cq_window_limits();
 }
 
@@ -840,7 +838,7 @@ nccl_ofi_gin_resources::~nccl_ofi_gin_resources()
 	/* Drop our slot in the registry. The entry is a weak_ptr so a stale one
 	   would be harmless, but releasing keeps the table from accumulating dead
 	   keys as endpoints come and go. */
-	gin_resources_registry().release(ep_holder.get());
+	gin_resources_registry().release(ep_holder.get(), this);
 
 	/* Deregister and free flush buffer before closing endpoints */
 	if (flush_buff_gpu_mr_handle) {

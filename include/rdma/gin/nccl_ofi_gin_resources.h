@@ -291,6 +291,19 @@ private:
 	nccl_net_ofi_domain_t &domain;
 };
 
+template <typename RegistryMap, typename Endpoint, typename Resource>
+static inline bool gin_registry_erase_if_same_resource(RegistryMap &entries,
+							       Endpoint endpoint,
+							       Resource *resource)
+{
+	auto it = entries.find(endpoint);
+	if (it == entries.end() || it->second.identity != resource) {
+		return false;
+	}
+	entries.erase(it);
+	return true;
+}
+
 /**
  * Registry mapping a net endpoint to the GIN resources built on top of it.
  *
@@ -312,13 +325,17 @@ public:
 	std::shared_ptr<nccl_ofi_gin_resources>
 	get(const std::shared_ptr<nccl_net_ofi_ep_t> &ep, uint32_t nranks);
 
-	/* Drop the slot for `ep`; called by the resources destructor. */
-	void release(nccl_net_ofi_ep_t *ep);
+	/* Drop this resource's slot without erasing a newer replacement. */
+	void release(nccl_net_ofi_ep_t *ep, nccl_ofi_gin_resources *resource);
 
 private:
+	struct registry_entry {
+		nccl_ofi_gin_resources *identity;
+		std::weak_ptr<nccl_ofi_gin_resources> resource;
+	};
+
 	std::mutex lock;
-	std::unordered_map<nccl_net_ofi_ep_t *, std::weak_ptr<nccl_ofi_gin_resources>>
-		by_ep;
+	std::unordered_map<nccl_net_ofi_ep_t *, registry_entry> by_ep;
 };
 
 /* Process-wide registry instance. */
