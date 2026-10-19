@@ -22,11 +22,12 @@ public:
 	int prepare_tx(nccl_ofi_gin_peer_rank_info &peer, gin_tx_flow_decision &decision,
 		       gin_flow_context &ctx, std::unique_lock<std::mutex> &ep_lock) override;
 
-	void prepare_ack(const nccl_ofi_gin_peer_rank_info &peer, uint32_t rx_consumed,
-			 gin_ack_msg_t &ack) override;
+	void prepare_ack(const nccl_ofi_gin_peer_rank_info &peer,
+			 uint32_t rx_consumed,
+			 gin_ack_msg &ack) override REQUIRES(resources.get_ep_lock());
 
 	void process_ack(nccl_ofi_gin_peer_rank_info &peer,
-			 const gin_ack_msg_t &ack,
+			 const gin_ack_msg &ack,
 			 bool is_newest_ack) override;
 
 private:
