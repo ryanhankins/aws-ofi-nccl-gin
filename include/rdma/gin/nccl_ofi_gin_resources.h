@@ -8,7 +8,9 @@
 #include "rdma/fabric.h"
 
 #include <array>
+#include <atomic>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <vector>
@@ -43,6 +45,7 @@ struct nccl_ofi_gin_ep_rail_t {
 	 *   failure) without leaking the provider fi_info list.
 	 */
 	nccl_ofi_gin_ep_rail_t(uint16_t rail_id_, nccl_net_ofi_domain_t &domain,
+			      size_t configured_rx_cq_size,
 			      ofi_info_ptr &&cached_gin_info = ofi_info_ptr(nullptr));
 
 	~nccl_ofi_gin_ep_rail_t() = default;
@@ -70,7 +73,8 @@ public:
 	 *
 	 * @param domain_arg: Domain object from net transport
 	 */
-	nccl_ofi_rdma_gin_ep_t(nccl_net_ofi_domain_t &domain_arg);
+	nccl_ofi_rdma_gin_ep_t(nccl_net_ofi_domain_t &domain_arg,
+		       uint32_t cq_sizing_nranks_arg);
 
 	nccl_ofi_rdma_gin_ep_t(const nccl_ofi_rdma_gin_ep_t &) = delete;
 	nccl_ofi_rdma_gin_ep_t &operator=(const nccl_ofi_rdma_gin_ep_t &) = delete;
@@ -104,6 +108,21 @@ public:
 	{
 		return scheduler;
 	}
+
+	size_t get_configured_rx_cq_size() const
+	{
+		return configured_rx_cq_size;
+	}
+
+	size_t get_rx_cq_reserve_margin() const
+	{
+		return rx_cq_reserve_margin;
+	}
+
+	uint32_t get_cq_sizing_nranks() const
+	{
+		return cq_sizing_nranks;
+	}
 	/**
 	 * Register memory region with this endpoint
 	 *
@@ -126,6 +145,7 @@ public:
 	 */
 	int process_cq();
 
+
 	void set_resources_owner(nccl_ofi_gin_resources *resources_arg)
 	{
 		resources_owner = resources_arg;
@@ -135,6 +155,13 @@ public:
 	using write_req_factory = nccl_net_ofi_gin_write_req_t *(*)(
 		nccl_ofi_gin_resources &, const nccl_net_ofi_gin_write_req_t::args &);
 	const write_req_factory make_write_req;
+	bool get_uses_posted_recv_flow() const
+	{
+		return uses_posted_recv_flow;
+	}
+
+	std::unique_ptr<gin_flow_policy> make_flow_policy(nccl_ofi_gin_resources &resources,
+					      uint32_t nranks) const;
 
 	/**
 	 * Close Libfabric endpoint object. For non-endpoint-MR providers, this
@@ -156,10 +183,20 @@ private:
 
 	/* Cached from param at construction; avoids mutex in CQ loop */
 	size_t cq_process_max_iter;
+	size_t rx_cq_reserve_margin;
+	bool uses_posted_recv_flow = false;
+
+	/* CQ sizing is fixed at EP creation, then clamped to the smallest CQ
+	 * depth fi_cq_open reports across rails. Later connects on the same
+	 * cached endpoint reuse that value because libfabric does not support
+	 * live CQ resize/replacement without rebuilding the endpoint. */
+	size_t configured_rx_cq_size;
+	const uint32_t cq_sizing_nranks;
 
 	using process_completions_fn = int (nccl_ofi_rdma_gin_ep_t::*)(
 		struct fi_cq_data_entry *cq_entry, fi_addr_t *src_addrs, uint64_t num_cqes,
 		uint16_t rail_id);
+
 
 	/*
 	 * FI_REMOTE_WRITE completion handling diverges by provider:
@@ -277,7 +314,7 @@ class nccl_ofi_gin_resources_registry {
 public:
 	/* Return the resources for `ep`, creating them on first use. */
 	std::shared_ptr<nccl_ofi_gin_resources>
-	get(const std::shared_ptr<nccl_net_ofi_ep_t> &ep);
+	get(const std::shared_ptr<nccl_net_ofi_ep_t> &ep, uint32_t nranks);
 
 	/* Drop the slot for `ep`; called by the resources destructor. */
 	void release(nccl_net_ofi_ep_t *ep);
@@ -296,7 +333,8 @@ nccl_ofi_gin_resources_registry &gin_resources_registry();
  */
 class nccl_ofi_gin_resources {
 public:
-	nccl_ofi_gin_resources(const std::shared_ptr<nccl_net_ofi_ep_t> &ep_arg);
+	nccl_ofi_gin_resources(const std::shared_ptr<nccl_net_ofi_ep_t> &ep_arg,
+				uint32_t nranks);
 
 	~nccl_ofi_gin_resources();
 
@@ -328,7 +366,7 @@ public:
 	 * Set a GIN communicator with given comm_id in map. Throw exception if
 	 * comm_id already exists. Caller must hold ep_lock.
 	 */
-	void set_comm(uint16_t comm_id, nccl_ofi_rdma_gin_put_comm &comm)
+	void set_comm(uint16_t comm_id, nccl_ofi_rdma_gin_put_comm &comm) REQUIRES(gin_ep.ep_lock)
 	{
 		if (OFI_UNLIKELY(comm_id >= NCCL_GIN_MAX_COMMS || gin_comms[comm_id] != nullptr)) {
 			NCCL_OFI_WARN("Failed to insert duplicate comm_id %d", comm_id);
@@ -341,7 +379,7 @@ public:
 	 * Remove a GIN communicator with given comm_id from map. Throw exception if
 	 * comm_id does not exist. Caller must hold ep_lock.
 	 */
-	void remove_comm(uint16_t comm_id)
+	void remove_comm(uint16_t comm_id) REQUIRES(gin_ep.ep_lock)
 	{
 		if (OFI_UNLIKELY(comm_id >= NCCL_GIN_MAX_COMMS || gin_comms[comm_id] == nullptr)) {
 			NCCL_OFI_WARN("Failed to remove comm_id %d (not found or out of range)", comm_id);
@@ -359,6 +397,10 @@ public:
 	{
 		return dev;
 	}
+
+	void maybe_warn_cq_sizing_mismatch(uint32_t requested_nranks);
+
+	uint32_t get_shared_cq_window_limit(uint32_t nranks) const REQUIRES(gin_ep.ep_lock);
 
 	size_t alloc_comm_id()
 	{
@@ -455,6 +497,17 @@ public:
 	 */
 	int progress();
 
+	/**
+	 * Called when a new communicator is associated with this resource object.
+	 * Caller must hold ep_lock.
+	 */
+	void increment_ref_cnt() REQUIRES(gin_ep.ep_lock);
+
+	/**
+	 * Called when an associated communicator is closed. Caller must hold ep_lock.
+	 */
+	void release() REQUIRES(gin_ep.ep_lock);
+
 private:
 	void init_flush_buffers(uint16_t num_rails);
 
@@ -502,6 +555,13 @@ private:
 
 	/* === Tier 3 — accessed only at connect/disconnect time === */
 	nccl_ofi_idpool_t comm_id_pool;
+
+	/* Number of associated comms */
+	size_t ref_cnt = 0;
+
+	std::atomic<bool> cq_sizing_mismatch_warned{false};
+
+	void refresh_shared_cq_window_limits() REQUIRES(gin_ep.ep_lock);
 
 	/* === Self-contained lookup — 8KB array at end to avoid pushing
 	   other hot members apart === */
