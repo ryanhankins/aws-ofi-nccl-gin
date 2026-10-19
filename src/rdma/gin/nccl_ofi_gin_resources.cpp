@@ -404,8 +404,6 @@ static inline struct fi_info *get_gin_info(struct fi_info *info)
 		throw std::runtime_error("No providers available for GIN");
 	} else if (results->next != nullptr) {
 		throw std::runtime_error("Unexpectedly got more than one GIN provider");
-	} else if (!(results->mode & FI_RX_CQ_DATA)) {
-		throw std::runtime_error("Provider does not support FI_RX_CQ_DATA");
 	} else if (results->domain_attr->cq_data_size < 4) {
 		throw std::runtime_error("Provider does not support cq_data_size of 4");
 	}
