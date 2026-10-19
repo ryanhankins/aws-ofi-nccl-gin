@@ -6,7 +6,8 @@
 
 #include <atomic>
 #include <cstring>
-#include <thread>
+#include <mutex>
+#include <vector>
 
 #include "rdma/gin/nccl_ofi_gin.h"
 #include "rdma/gin/nccl_ofi_gin_api.h"
@@ -304,6 +305,19 @@ ncclResult_t nccl_ofi_gin_closeColl(void *collComm)
 	int ret = gin_comm->await_pending_requests();
 	if (OFI_UNLIKELY(ret != 0)) {
 		return nccl_net_ofi_retval_translate(ret);
+	}
+
+	if (endpoint_mr) {
+		/* Proxy threads have stopped. Keep progressing until every peer has
+		   drained its ACK requests, including ranks with no requests of their own. */
+		std::vector<char> arrived(gin_comm->get_nranks(), 0);
+		ret = gin_comm->get_ag_comm().all_gather(arrived.data(), 1, [&]() {
+			std::lock_guard<std::mutex> lock(gin_comm->get_ep_lock());
+			return gin_comm->get_resources().progress();
+		});
+		if (OFI_UNLIKELY(ret != 0)) {
+			return nccl_net_ofi_retval_translate(ret);
+		}
 	}
 
 	/* Phase 1 — quiesce the shared gdrcopy worker for this comm. The worker

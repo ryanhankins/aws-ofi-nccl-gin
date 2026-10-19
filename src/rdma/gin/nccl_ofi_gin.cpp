@@ -500,6 +500,18 @@ int nccl_ofi_rdma_gin_put_comm::deregMrSymLocked(nccl_ofi_rdma_gin_symm_mr_handl
 	}
 
 	if (mr_handle->type == NCCL_PTR_CUDA) {
+		/* The gdrcopy worker may still hold queued signal work that points
+		   into the segments released below (a peer's last signals can land
+		   after the window is torn down locally). Let it finish first; this
+		   is the same drain closeColl does before deleting the comm. New
+		   hand-offs cannot start meanwhile: they need ep_lock, which we hold. */
+		while (has_outstanding_gdrcopy()) {
+			if (OFI_UNLIKELY(drain_gdrcopy_done_queue() != 0)) {
+				break;
+			}
+			std::this_thread::yield();
+		}
+
 		/* Release the lazily-pinned segments under the worker's append
 		   lock. Best-effort: log and continue on error, never bail out. */
 		std::lock_guard<std::mutex> seg_lock(signal_segs_mtx);
