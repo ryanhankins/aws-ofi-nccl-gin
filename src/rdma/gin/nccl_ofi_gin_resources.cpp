@@ -70,6 +70,30 @@ nccl_ofi_rdma_gin_ep_t::~nccl_ofi_rdma_gin_ep_t()
 	}
 }
 
+int nccl_ofi_rdma_gin_ep_t::dispatch_via_op_context(struct fi_cq_data_entry *cq_entry,
+						    fi_addr_t src_addr, uint16_t rail_id)
+{
+	void *op_ctx = cq_entry->op_context;
+
+	if (OFI_UNLIKELY(op_ctx == NULL)) {
+		NCCL_OFI_WARN("Invalid request context provided");
+		return -EINVAL;
+	}
+
+	nccl_net_ofi_gin_context *ctx =
+		cpp_container_of(static_cast<struct fi_context2 *>(op_ctx),
+				 &nccl_net_ofi_gin_context::ofi_ctx);
+
+	int ret = ctx->handle_cq_entry(reinterpret_cast<struct fi_cq_entry *>(cq_entry), src_addr,
+					rail_id);
+	if (ret != 0) {
+		NCCL_OFI_WARN("Context progress failed: %d", ret);
+		return ret;
+	}
+
+	return 0;
+}
+
 int nccl_ofi_rdma_gin_ep_t::gin_process_completions(struct fi_cq_data_entry *cq_entry,
 					       fi_addr_t *src_addrs, uint64_t num_cqes,
 					       uint16_t rail_id)
@@ -77,22 +101,8 @@ int nccl_ofi_rdma_gin_ep_t::gin_process_completions(struct fi_cq_data_entry *cq_
 	int ret = 0;
 
 	for (uint64_t comp_idx = 0; comp_idx < num_cqes; comp_idx++) {
-		void *op_ctx = cq_entry[comp_idx].op_context;
-
-		if (OFI_UNLIKELY(op_ctx == NULL)) {
-			NCCL_OFI_WARN("Invalid request context provided");
-			return -EINVAL;
-		}
-
-		nccl_net_ofi_gin_context *ctx =
-			cpp_container_of(static_cast<struct fi_context2 *>(op_ctx),
-					 &nccl_net_ofi_gin_context::ofi_ctx);
-
-		ret = ctx->handle_cq_entry(
-			reinterpret_cast<struct fi_cq_entry *>(&cq_entry[comp_idx]),
-			src_addrs[comp_idx], rail_id);
+		ret = dispatch_via_op_context(&cq_entry[comp_idx], src_addrs[comp_idx], rail_id);
 		if (ret != 0) {
-			NCCL_OFI_WARN("Context progress failed: %d", ret);
 			return ret;
 		}
 	}
@@ -109,10 +119,12 @@ int nccl_ofi_rdma_gin_ep_t::gin_process_error_entry(struct fi_cq_err_entry *err_
 		return -EINVAL;
 	}
 
-	nccl_net_ofi_gin_context *ctx = cpp_container_of(static_cast<struct fi_context2 *>(op_ctx),
-							 &nccl_net_ofi_gin_context::ofi_ctx);
+	nccl_net_ofi_gin_context *ctx =
+		cpp_container_of(static_cast<struct fi_context2 *>(op_ctx),
+				 &nccl_net_ofi_gin_context::ofi_ctx);
 
-	return ctx->handle_error_entry(cq, err_entry, rail_id);
+	return ctx->handle_error_entry(cq, err_entry,
+					 rail_id);
 }
 
 int nccl_ofi_rdma_gin_ep_t::gin_process_cq_rail(uint16_t rail_id)
