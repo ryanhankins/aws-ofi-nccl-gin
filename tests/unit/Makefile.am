@@ -35,6 +35,7 @@ noinst_PROGRAMS = \
 	gin_close_progress \
 	gin_write_req \
 	gin_cq_math \
+	gin_resource_registry \
 	gin_comm_id_lifecycle
 
 if WANT_PLATFORM_AWS
@@ -78,6 +79,7 @@ mpsc_ring_SOURCES = $(base_sources) mpsc_ring.cpp
 gin_write_req_SOURCES = $(base_sources) gin_write_req.cpp
 gin_cq_math_SOURCES = $(base_sources) gin_cq_math.cpp
 gin_close_progress_SOURCES = $(base_sources) gin_close_progress.cpp
+gin_resource_registry_SOURCES = $(base_sources) gin_resource_registry.cpp
 gin_comm_id_lifecycle_SOURCES = $(base_sources) gin_comm_id_lifecycle.cpp
 
 TESTS = $(noinst_PROGRAMS)
