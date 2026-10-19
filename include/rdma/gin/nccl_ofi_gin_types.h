@@ -23,7 +23,7 @@ class nccl_ofi_rdma_gin_put_comm;
 class nccl_ofi_gin_resources;
 struct nccl_ofi_gin_ep_rail_t;
 struct nccl_ofi_gin_peer_rank_info;
-struct gin_ack_msg_t;
+struct gin_ack_msg;
 
 struct gin_tx_flow_decision {
 	bool request_ack = false;
@@ -65,10 +65,10 @@ public:
 			      gin_flow_context &ctx) = 0;
 
 	virtual void prepare_ack(const nccl_ofi_gin_peer_rank_info &peer,
-				uint32_t rx_consumed, gin_ack_msg_t &ack) = 0;
+				uint32_t rx_consumed, gin_ack_msg &ack) = 0;
 
 	virtual void process_ack(nccl_ofi_gin_peer_rank_info &peer,
-			 const gin_ack_msg_t &ack) = 0;
+			 const gin_ack_msg &ack) = 0;
 };
 
 /**
@@ -94,7 +94,7 @@ enum gin_msg_type_t : uint8_t {
  * Immediate data format (32 bits) for RDMA write-with-immediate signals.
  *
  * ACKs are no longer sent via immediate data — they use fi_send with
- * gin_ack_msg_t.  The immediate data is used only for data signals:
+ * gin_ack_msg.  The immediate data is used only for data signals:
  *
  *  31      29  28  27      24 23             11 10            1  0
  *  [unused:3] [ar] [seg_cnt ] [  msg_seq_num  ] [   comm_id   ] [0]
@@ -145,6 +145,14 @@ static_assert(((1 << GIN_MSG_TYPE_BITS) - 1) >= GIN_MSG_TYPE_MAX,
 #define GIN_RX_CONSUMED_BITS  (GIN_IMM_SEQ_BITS + 1)
 #define GIN_RX_CONSUMED_MASK  (((uint64_t)1 << GIN_RX_CONSUMED_BITS) - 1)
 #define GIN_RX_CONSUMED_HALF  ((uint32_t)((GIN_RX_CONSUMED_MASK + 1) >> 1))
+
+/* Validate the full peer-rank value before narrowing it or using it to index
+ * rank_comms. Endpoint-MR providers carry rank values in untrusted CQ/wire
+ * data, so checking only after a uint32_t cast can hide malformed values. */
+static inline bool gin_peer_rank_is_valid(uint64_t peer_rank, int nranks)
+{
+	return nranks > 0 && peer_rank < static_cast<uint64_t>(nranks);
+}
 static_assert((1ULL << GIN_RX_CONSUMED_BITS) == 2ULL * (GIN_IMM_SEQ_MASK + 1),
 	      "GIN_RX_CONSUMED_BITS must give exactly 2x the seq window for "
 	      "wrap-safe forward-delta comparison between TX/RX cursors");
@@ -180,15 +188,34 @@ static_assert(GIN_ACK_INTERVAL <= (GIN_IMM_SEQ_MASK >> 1),
 /* Maximum number of GIN comms */
 #define NCCL_GIN_MAX_COMMS    (1 << GIN_IMM_COMM_BITS)
 
+/* Sender rank carried in control messages. Only populated for providers whose
+ * receive completions carry no usable source address (endpoint-MR providers
+ * such as CXI); zero otherwise. */
+#define GIN_MSG_SRC_RANK_BITS 20
+
+/* Endpoint-MR control messages encode ranks in 20 bits. The connect path has
+ * no existing rank-count bound, so reject sizes that cannot be represented. */
+static inline bool gin_rank_count_is_valid(int nranks, bool uses_endpoint_mr)
+{
+	return nranks > 0 &&
+		(!uses_endpoint_mr ||
+		 static_cast<uint64_t>(nranks) <= (1ULL << GIN_MSG_SRC_RANK_BITS));
+}
+
+static inline size_t gin_required_cq_data_size(bool uses_endpoint_mr)
+{
+	return uses_endpoint_mr ? sizeof(uint64_t) : sizeof(uint32_t);
+}
+
 /* Reserved bit computation for Metadata message header */
 #define GIN_MSG_HEADER_RESERVED_BITS (64 - GIN_MSG_TYPE_BITS - GIN_IMM_COMM_BITS \
                                       - GIN_IMM_SEQ_BITS - GIN_IMM_SEG_CNT_BITS \
-                                      - 1 /* ack_req */)
+                                      - 1 /* ack_req */ - GIN_MSG_SRC_RANK_BITS)
 
 /**
  * Metadata message header (64 bits).
  *
- * Both nccl_net_ofi_gin_msg_header_t and gin_ack_msg_t share a common
+ * Both nccl_net_ofi_gin_msg_header_t and gin_ack_msg share a common
  * prefix in bits [0:25]: msg_type(2) + comm_id(10) + rx_consumed(14) =
  * 26 bits.  This allows dispatch and ACK processing to read from the
  * same offsets regardless of message type.
@@ -206,6 +233,8 @@ struct nccl_net_ofi_gin_msg_header_t {
 	 * sets both to the same value, the receiver OR's them across the two
 	 * submission paths. */
 	uint64_t ack_req         : 1;
+	/* Sender rank (see GIN_MSG_SRC_RANK_BITS) */
+	uint64_t src_rank        : GIN_MSG_SRC_RANK_BITS;
 	/* Reserved for future use */
 	uint64_t reserved        : GIN_MSG_HEADER_RESERVED_BITS;
 };
@@ -230,7 +259,9 @@ static_assert(sizeof(nccl_net_ofi_gin_signal_metadata_msg_t) == 32,
 #define GIN_CXI_EQ_EVENT_BUDGET 384
 #define GIN_CXI_PAIR_DOORBELL_MIN (64 * 1024)
 #define GIN_ACK_GRANT_MAX ((1U << GIN_ACK_MSG_GRANTED_WINDOW_BITS) - 1)
-#define GIN_ACK_MSG_RESERVED_BITS (64 - GIN_MSG_TYPE_BITS - GIN_IMM_COMM_BITS - GIN_RX_CONSUMED_BITS - GIN_ACK_MSG_GRANTED_WINDOW_BITS)
+#define GIN_ACK_MSG_RESERVED_BITS \
+	(64 - GIN_MSG_TYPE_BITS - GIN_IMM_COMM_BITS - GIN_RX_CONSUMED_BITS \
+	 - GIN_ACK_MSG_GRANTED_WINDOW_BITS - GIN_MSG_SRC_RANK_BITS)
 
 /**
  * Standalone ACK message sent via fi_send from receiver to sender (8 bytes).
@@ -238,7 +269,7 @@ static_assert(sizeof(nccl_net_ofi_gin_signal_metadata_msg_t) == 32,
  * Shares the common prefix layout with nccl_net_ofi_gin_msg_header_t
  * so msg_type-based dispatch works at the same bit position.
  */
-struct gin_ack_msg_t {
+struct gin_ack_msg {
 	/* Message type identifier */
 	uint64_t msg_type        : GIN_MSG_TYPE_BITS;
 	/* Comm identifier on the original sender side */
@@ -247,11 +278,14 @@ struct gin_ack_msg_t {
 	uint64_t rx_consumed     : GIN_RX_CONSUMED_BITS;
 	/* Receiver-granted sender outstanding window */
 	uint64_t granted_window  : GIN_ACK_MSG_GRANTED_WINDOW_BITS;
+	/* Sender rank for providers without a usable completion source address. */
+	uint64_t src_rank        : GIN_MSG_SRC_RANK_BITS;
 	/* Reserved for future use */
 	uint64_t reserved        : GIN_ACK_MSG_RESERVED_BITS;
 };
-static_assert(sizeof(gin_ack_msg_t) <= 8,
-	      "gin_ack_msg_t must be exactly 8 bytes for inline send");
+using gin_ack_msg_t = gin_ack_msg;
+static_assert(sizeof(gin_ack_msg) <= 8,
+	      "gin_ack_msg must be exactly 8 bytes for inline send");
 
 /* Above layout assume little-endian byte order, as well as following static
    assert checks. All message structs must have msg_type at the lowest bits
@@ -266,14 +300,20 @@ static_assert(offsetof(nccl_net_ofi_gin_signal_metadata_msg_t, header) == 0,
 #if !defined(__clang__) && defined(__GNUC__) && (__GNUC__ >= 9)
 static_assert(
 	__builtin_bit_cast(uint64_t,
-		nccl_net_ofi_gin_msg_header_t{GIN_MSG_TYPE_MAX, 0, 0, 0, 0, 0})
+		nccl_net_ofi_gin_msg_header_t{GIN_MSG_TYPE_MAX, 0, 0, 0, 0, 0, 0})
 		== (uint64_t)GIN_MSG_TYPE_MAX,
 	"msg_type must be at LSB of nccl_net_ofi_gin_msg_header_t");
 static_assert(
 	__builtin_bit_cast(uint64_t,
-		gin_ack_msg_t{GIN_MSG_TYPE_MAX, 0, 0, 0, 0})
+		gin_ack_msg{GIN_MSG_TYPE_MAX, 0, 0, 0, 0, 0})
 		== (uint64_t)GIN_MSG_TYPE_MAX,
-	"msg_type must be at LSB of gin_ack_msg_t");
+	"msg_type must be at LSB of gin_ack_msg");
+static_assert(__builtin_bit_cast(uint64_t,
+		gin_ack_msg{0, 0, 0, 0, 1, 0}) == (1ULL << 40),
+	"src_rank must follow the granted window in gin_ack_msg");
+static_assert(__builtin_bit_cast(uint64_t,
+		nccl_net_ofi_gin_msg_header_t{0, 0, 0, 0, 0, 1, 0}) == (1ULL << 30),
+	"src_rank must follow metadata fields in the GIN header");
 #endif
 
 /* Base half-window ACK-request threshold. Runtime code clamps this
@@ -396,7 +436,7 @@ static inline void gin_complete_pending_ack_request(
 }
 
 static inline void gin_fill_ack_header(const nccl_ofi_gin_peer_rank_info &peer,
-			       uint32_t rx_consumed, gin_ack_msg_t &ack)
+			       uint32_t rx_consumed, gin_ack_msg &ack)
 {
 	ack = {};
 	ack.msg_type = GIN_MSG_TYPE_ACK;

@@ -45,6 +45,38 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
+	/* Source ranks are carried in endpoint-MR wire/CQ data. Validate the
+	 * full value before narrowing it to uint32_t or using it as an index. */
+	const struct {
+		uint64_t peer_rank;
+		uint32_t nranks;
+		bool expected;
+	} peer_rank_cases[] = {
+		{0, 1, true},
+		{3, 4, true},
+		{4, 4, false},
+		{UINT32_MAX, 4, false},
+		{UINT64_MAX, 4, false},
+		{0, 0, false},
+	};
+	for (const auto &tc : peer_rank_cases) {
+		if (gin_peer_rank_is_valid(tc.peer_rank, tc.nranks) != tc.expected) {
+			printf("Peer-rank bounds check failed: rank=%llu nranks=%u\n",
+			       static_cast<unsigned long long>(tc.peer_rank), tc.nranks);
+			return 1;
+		}
+	}
+	const uint64_t max_wire_ranks = 1ULL << GIN_MSG_SRC_RANK_BITS;
+	if (gin_rank_count_is_valid(max_wire_ranks, true) != true ||
+	    gin_rank_count_is_valid(max_wire_ranks + 1, true) ||
+	    !gin_rank_count_is_valid(max_wire_ranks + 1, false) ||
+	    gin_rank_count_is_valid(0, true) ||
+	    gin_required_cq_data_size(true) != sizeof(uint64_t) ||
+	    gin_required_cq_data_size(false) != sizeof(uint32_t)) {
+		printf("Endpoint-MR rank or CQ data-width requirement failed\n");
+		return 1;
+	}
+
 	/* If we start requesting ACKs at threshold and then request another one
 	 * every interval ops, threshold + interval + the one-op escape hatch must
 	 * still fit under the refresh window. Small windows clamp threshold to 1. */

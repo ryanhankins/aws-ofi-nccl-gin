@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -76,6 +77,14 @@ public:
 	 */
 	nccl_ofi_rdma_gin_ep_t(nccl_net_ofi_domain_t &domain_arg,
 		       uint32_t cq_sizing_nranks_arg);
+
+	/**
+	 * Handler for remote-write CQ entries that carry no op_context. Endpoint-MR
+	 * providers (CXI) deliver write-with-immediate data without consuming a
+	 * posted receive, so there is no rx request to dispatch through. Set by
+	 * nccl_ofi_gin_resources; only used when endpoint_mr is true.
+	 */
+	std::function<int(struct fi_cq_data_entry *, fi_addr_t, uint16_t)> remote_write_cb;
 
 	nccl_ofi_rdma_gin_ep_t(const nccl_ofi_rdma_gin_ep_t &) = delete;
 	nccl_ofi_rdma_gin_ep_t &operator=(const nccl_ofi_rdma_gin_ep_t &) = delete;
@@ -147,11 +156,6 @@ public:
 	int process_cq();
 
 
-	void set_resources_owner(nccl_ofi_gin_resources *resources_arg)
-	{
-		resources_owner = resources_arg;
-	}
-
 	bool get_uses_posted_recv_flow() const
 	{
 		return uses_posted_recv_flow;
@@ -175,8 +179,6 @@ private:
 	std::vector<nccl_ofi_gin_ep_rail_t> rails;
 
 	nccl_net_ofi_scheduler *scheduler;
-
-	nccl_ofi_gin_resources *resources_owner = nullptr;
 
 	/* Cached from param at construction; avoids mutex in CQ loop */
 	size_t cq_process_max_iter;
@@ -238,9 +240,6 @@ private:
 	 * above for every completion that isn't routed by MR/immediate data. */
 	int dispatch_via_op_context(struct fi_cq_data_entry *cq_entry, fi_addr_t src_addr,
 				    uint16_t rail_id);
-
-	int handle_remote_write_completion(struct fi_cq_data_entry *cq_entry, fi_addr_t src_addr,
-					   uint16_t rail_id);
 
 	/**
 	 * CQ error entry handler
@@ -357,6 +356,14 @@ public:
 		}
 
 		return *gin_comms[comm_id];
+	}
+
+	nccl_ofi_rdma_gin_put_comm *find_comm(uint16_t comm_id) const
+	{
+		if (OFI_UNLIKELY(comm_id >= NCCL_GIN_MAX_COMMS)) {
+			return nullptr;
+		}
+		return gin_comms[comm_id];
 	}
 
 	/**

@@ -24,9 +24,11 @@
 #include "nccl_ofi_param.h"
 #include "nccl_ofi.h"
 #include "nccl_ofi_log.h"
+#include "rdma/gin/nccl_ofi_gin.h"
 
 std::shared_ptr<nccl_ofi_gin_resources>
-nccl_ofi_gin_resources_registry::get(const std::shared_ptr<nccl_net_ofi_ep_t> &ep, uint32_t nranks)
+nccl_ofi_gin_resources_registry::get(const std::shared_ptr<nccl_net_ofi_ep_t> &ep,
+								   uint32_t nranks)
 {
 	std::lock_guard<std::mutex> guard(lock);
 
@@ -181,18 +183,21 @@ int nccl_ofi_rdma_gin_ep_t::gin_process_completions_writedata_routed(
 	int ret = 0;
 
 	for (uint64_t comp_idx = 0; comp_idx < num_cqes; comp_idx++) {
-		if (cq_entry[comp_idx].flags & FI_REMOTE_WRITE) {
-			/* Target-side writedata completions are keyed by the bound MR,
-			 * not by a posted fi_recv() context, so route them here by
-			 * completion flags + immediate data before touching op_context. */
-			ret = handle_remote_write_completion(&cq_entry[comp_idx],
-							     src_addrs[comp_idx], rail_id);
-			if (ret != 0) {
-				NCCL_OFI_WARN("GIN remote-write completion handling failed: %d",
-					      ret);
+		void *op_ctx = cq_entry[comp_idx].op_context;
+
+		if (op_ctx == NULL && endpoint_mr && remote_write_cb &&
+		    (cq_entry[comp_idx].flags & FI_REMOTE_WRITE)) {
+			ret = remote_write_cb(&cq_entry[comp_idx], src_addrs[comp_idx], rail_id);
+			if (OFI_UNLIKELY(ret != 0)) {
+				NCCL_OFI_WARN("Remote write completion failed: %d", ret);
 				return ret;
 			}
 			continue;
+		}
+
+		if (OFI_UNLIKELY(op_ctx == NULL)) {
+			NCCL_OFI_WARN("Invalid request context provided");
+			return -EINVAL;
 		}
 
 		ret = dispatch_via_op_context(&cq_entry[comp_idx], src_addrs[comp_idx], rail_id);
@@ -470,6 +475,16 @@ int nccl_ofi_rdma_gin_ep_t::freelist_deregmr_fn(void *handle)
 /**
  * Much of this taken from the same function in RDMA transport
  */
+/**
+ * EFA reports FI_RX_CQ_DATA as the way to avoid consuming receive buffers for
+ * write-with-immediate. Endpoint-MR providers (CXI) deliver remote CQ data
+ * without consuming a receive and do not advertise the mode bit.
+ */
+static inline bool gin_provider_needs_rx_cq_data(const struct fi_info *ref_info)
+{
+	return !(ref_info->domain_attr->mr_mode & FI_MR_ENDPOINT);
+}
+
 static inline void get_gin_hints(struct fi_info &hints, struct fi_info *ref_info)
 {
 	hints.caps = 0;
@@ -481,14 +496,25 @@ static inline void get_gin_hints(struct fi_info &hints, struct fi_info *ref_info
 	hints.caps |= FI_LOCAL_COMM | FI_REMOTE_COMM | FI_SOURCE;
 
 	/* Mode. GIN sets `FI_RX_CQ_DATA` as an indirect way to disable unsolicited write */
-	hints.mode = FI_CONTEXT | FI_CONTEXT2 | FI_RX_CQ_DATA;
+	hints.mode = FI_CONTEXT | FI_CONTEXT2;
+	if (gin_provider_needs_rx_cq_data(ref_info)) {
+		hints.mode |= FI_RX_CQ_DATA;
+	}
 
 	hints.ep_attr->type = FI_EP_RDM;
 
-	hints.domain_attr->mr_mode =
-		FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED |
-		FI_MR_PROV_KEY | FI_MR_ENDPOINT;
-	hints.domain_attr->mr_key_size = (size_t)ofi_nccl_mr_key_size();
+	if (ref_info->domain_attr->mr_mode & FI_MR_ENDPOINT) {
+		/* Endpoint-MR providers (CXI): mirror the mode the NET transport
+		   negotiated; keys are provider-generated and as wide as the
+		   provider says. */
+		hints.domain_attr->mr_mode = FI_MR_HMEM | FI_MR_ALLOCATED | FI_MR_PROV_KEY |
+					     FI_MR_ENDPOINT;
+		hints.domain_attr->mr_key_size = ref_info->domain_attr->mr_key_size;
+	} else {
+		hints.domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR |
+					     FI_MR_ALLOCATED | FI_MR_PROV_KEY;
+		hints.domain_attr->mr_key_size = (size_t)ofi_nccl_mr_key_size();
+	}
 	hints.domain_attr->threading = FI_THREAD_COMPLETION;
 
 	hints.domain_attr->control_progress =
@@ -496,9 +522,9 @@ static inline void get_gin_hints(struct fi_info &hints, struct fi_info *ref_info
 	hints.domain_attr->data_progress =
 		nccl_ofi_translate_progress_enum(ofi_nccl_progress_model.get());
 
-	/* The GIN transport requires fi_writedata support with 32 bits
-	   (4 bytes) of immediate data */
-	hints.domain_attr->cq_data_size = 4;
+	/* Endpoint-MR completions encode the sender rank in the upper 32 bits. */
+	hints.domain_attr->cq_data_size = gin_required_cq_data_size(
+		(ref_info->domain_attr->mr_mode & FI_MR_ENDPOINT) != 0);
 
 	/* Copy domain and fabric names from previously opened net transport.
 	   Note the domain and fabric names are required to obtain exactly one result. */
@@ -546,8 +572,10 @@ static inline struct fi_info *get_gin_info(struct fi_info *info)
 		throw std::runtime_error("No providers available for GIN");
 	} else if (results->next != nullptr) {
 		throw std::runtime_error("Unexpectedly got more than one GIN provider");
-	} else if (results->domain_attr->cq_data_size < 4) {
-		throw std::runtime_error("Provider does not support cq_data_size of 4");
+	} else if (gin_provider_needs_rx_cq_data(info) && !(results->mode & FI_RX_CQ_DATA)) {
+		throw std::runtime_error("Provider does not support FI_RX_CQ_DATA");
+	} else if (results->domain_attr->cq_data_size < gin_hints->domain_attr->cq_data_size) {
+		throw std::runtime_error("Provider CQ data is narrower than the GIN wire format");
 	}
 
 	return results.release();
@@ -647,15 +675,6 @@ nccl_ofi_gin_resources::nccl_ofi_gin_resources(const std::shared_ptr<nccl_net_of
       comm_id_pool(NCCL_GIN_MAX_COMMS)
 {
 	auto num_rails = gin_ep.get_num_rails();
-	/* Must be set before any CQ processing begins. gin_ep was just
-	 * constructed via the member-initializer list above (creating the CQ
-	 * and endpoints), but nothing can call gin_ep.process_cq() /
-	 * this->progress() until this constructor returns and the caller
-	 * obtains a reference to this resources object, so there is no window
-	 * in which handle_remote_write_completion() can observe
-	 * resources_owner still nullptr. */
-	gin_ep.set_resources_owner(this);
-
 	/* Create freelist for RX buffers */
 	constexpr size_t num_buffers = 2048; /* TODO param*/
 	assert_always(num_rails > 0 && num_buffers % num_rails == 0);
@@ -669,7 +688,7 @@ nccl_ofi_gin_resources::nccl_ofi_gin_resources(const std::shared_ptr<nccl_net_of
 	this->rx_buff_fl.reset(rx_buff_fl_tmp);
 
 	/* Create freelist for ACK send buffers */
-	this->ack_send_fl.reset(new nccl_ofi_freelist(sizeof(gin_ack_msg_t), 64, 64, 0, nullptr,
+	this->ack_send_fl.reset(new nccl_ofi_freelist(sizeof(gin_ack_msg), 64, 64, 0, nullptr,
 						      nullptr, gin_ep.freelist_regmr_fn,
 						      gin_ep.freelist_deregmr_fn, &gin_ep, 1,
 						      "GIN ACK Send", true));
@@ -687,6 +706,19 @@ nccl_ofi_gin_resources::nccl_ofi_gin_resources(const std::shared_ptr<nccl_net_of
 	this->req_fl.reset(req_fl_tmp);
 
 	init_flush_buffers(num_rails);
+
+	if (endpoint_mr) {
+		gin_ep.remote_write_cb = [this](struct fi_cq_data_entry *e, fi_addr_t src,
+						uint16_t rail) NO_THREAD_SAFETY_ANALYSIS {
+			auto *gin_comm = find_comm(GIN_IMM_GET_COMM_ID(e->data));
+			if (OFI_UNLIKELY(gin_comm == nullptr)) {
+				NCCL_OFI_WARN("Dropping GIN remote-write completion "
+					      "for stale comm id");
+				return 0;
+			}
+			return gin_comm->handle_signal_write_completion(e, src, rail);
+		};
+	}
 }
 
 uint32_t nccl_ofi_gin_resources::get_shared_cq_window_limit(uint32_t nranks) const

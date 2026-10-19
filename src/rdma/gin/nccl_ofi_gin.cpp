@@ -196,7 +196,11 @@ int nccl_ofi_rdma_gin_listen_comm::connect(nccl_net_ofi_conn_handle_t *handles[]
 
 	NCCL_OFI_TRACE(NCCL_NET, "gin: connect() nranks %d rank %d", nranks, rank);
 
-	assert(nranks > 0);
+	if (OFI_UNLIKELY(!gin_rank_count_is_valid(nranks, endpoint_mr))) {
+		NCCL_OFI_WARN("GIN communicator size %d exceeds the endpoint-MR rank field",
+			      nranks);
+		return -EINVAL;
+	}
 
 	nccl_net_ofi_send_comm *s_comm = nullptr;
 	nccl_net_ofi_recv_comm *r_comm = nullptr;
@@ -289,7 +293,7 @@ int nccl_ofi_rdma_gin_listen_comm::connect(nccl_net_ofi_conn_handle_t *handles[]
 	return 0;
 }
 
-int nccl_ofi_rdma_gin_put_comm::send_ack(uint32_t peer_rank, const gin_ack_msg_t &ack_msg)
+int nccl_ofi_rdma_gin_put_comm::send_ack(uint32_t peer_rank, const gin_ack_msg &ack_msg)
 {
 	/* For now, always send acks on rail 0.
 	   TODO round-robin this like the payload data itself. */
@@ -306,8 +310,11 @@ int nccl_ofi_rdma_gin_put_comm::send_ack(uint32_t peer_rank, const gin_ack_msg_t
 		return -ENOMEM;
 	}
 
-	auto *ack_buf = static_cast<gin_ack_msg_t *>(ack_elem->ptr);
+	auto *ack_buf = static_cast<gin_ack_msg *>(ack_elem->ptr);
 	*ack_buf = ack_msg;
+	if (endpoint_mr) {
+		ack_buf->src_rank = static_cast<uint64_t>(rank);
+	}
 
 	auto *ofi_ep = ep.get_rail(rail_id).ofi_ep.get();
 
@@ -764,6 +771,12 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 		nseg += num_xfers;
 		assert_always(nseg > 0);
 		uint64_t data = GIN_IMM_SEG_DATA(remote_comm_id, msg_seq_num, nseg, is_ack_requested);
+		if (endpoint_mr) {
+			/* Remote CQ data on endpoint-MR providers (CXI) carries no source
+			   address; the sender rank rides in the upper 32 bits of the
+			   64-bit CQ data. */
+			data |= static_cast<uint64_t>(this->rank) << 32;
+		}
 
 		/* The metadata send (if any) colocates with the first stripe's rail. */
 		rail_id = xfers[0].rail_id;
@@ -853,6 +866,9 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 		metadata_send->header.seq_num = msg_seq_num;
 		metadata_send->header.seq_seg_cnt = nseg;
 		metadata_send->header.ack_req = is_ack_requested ? 1 : 0;
+		if (endpoint_mr) {
+			metadata_send->header.src_rank = static_cast<uint64_t>(this->rank);
+		}
 		metadata_send->signal_base_address =
 			(sig_mr ? sig_mr->remote_mr[dst_rank].address : 0);
 		metadata_send->signal_offset = signalOff;
@@ -1686,7 +1702,7 @@ int nccl_ofi_rdma_gin_put_comm::maybe_send_ack(uint32_t peer_rank, bool sender_r
 	}
 
 	auto &rank_comm = this->rank_comms[peer_rank];
-	gin_ack_msg_t ack_msg = {};
+	gin_ack_msg ack_msg = {};
 	flow_policy->prepare_ack(rank_comm, rank_comm.rx_consumed, ack_msg);
 	int ret = send_ack(peer_rank, ack_msg);
 	if (OFI_UNLIKELY(ret != 0)) {
@@ -1874,7 +1890,14 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
 	uint16_t msg_seq_num = metadata_msg->header.seq_num;
 	uint16_t num_segments = metadata_msg->header.seq_seg_cnt;
 
-	uint32_t peer_rank = get_peer_rank(src_addr, rank_map[rail_id]);
+	const uint64_t peer_rank_value = endpoint_mr ? metadata_msg->header.src_rank
+						     : get_peer_rank(src_addr, rank_map[rail_id]);
+	if (OFI_UNLIKELY(!gin_peer_rank_is_valid(peer_rank_value, nranks))) {
+		NCCL_OFI_WARN("Invalid GIN metadata source rank %llu (nranks=%d) on rail %u",
+			      static_cast<unsigned long long>(peer_rank_value), nranks, rail_id);
+		return -EINVAL;
+	}
+	const uint32_t peer_rank = static_cast<uint32_t>(peer_rank_value);
 
 	NCCL_OFI_TRACE_GIN_HANDLE_SIGNAL_METADATA_COMPLETION_FUNC_START(
 		dev, this, rail_id, peer_rank, msg_seq_num, num_segments);
@@ -1916,23 +1939,17 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
 	return ret;
 }
 
-int nccl_ofi_rdma_gin_ep_t::handle_remote_write_completion(struct fi_cq_data_entry *cq_entry,
-							   fi_addr_t src_addr, uint16_t rail_id)
-{
-	if (OFI_UNLIKELY(resources_owner == nullptr)) {
-		NCCL_OFI_WARN("GIN remote-write completion arrived before resources owner init");
-		return -EINVAL;
-	}
-
-	uint16_t comm_id = GIN_IMM_GET_COMM_ID(cq_entry->data);
-	auto &gin_comm = resources_owner->get_comm(comm_id);
-	return gin_comm.handle_signal_write_completion(cq_entry, src_addr, rail_id);
-}
-
-int nccl_ofi_rdma_gin_put_comm::handle_ack_completion(const gin_ack_msg_t *ack_msg,
+int nccl_ofi_rdma_gin_put_comm::handle_ack_completion(const gin_ack_msg *ack_msg,
 						      fi_addr_t src_addr, uint16_t rail_id)
 {
-	uint32_t peer_rank = get_peer_rank(src_addr, rank_map[rail_id]);
+	const uint64_t peer_rank_value = endpoint_mr ? ack_msg->src_rank
+						     : get_peer_rank(src_addr, rank_map[rail_id]);
+	if (OFI_UNLIKELY(!gin_peer_rank_is_valid(peer_rank_value, nranks))) {
+		NCCL_OFI_WARN("Invalid GIN ACK source rank %llu (nranks=%d) on rail %u",
+			      static_cast<unsigned long long>(peer_rank_value), nranks, rail_id);
+		return -EINVAL;
+	}
+	const uint32_t peer_rank = static_cast<uint32_t>(peer_rank_value);
 	uint32_t rx_consumed = ack_msg->rx_consumed;
 
 	NCCL_OFI_TRACE_GIN_HANDLE_ACK_COMPLETION_FUNC_START(dev, this, rail_id, peer_rank, rx_consumed);
@@ -1959,7 +1976,14 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_write_completion(struct fi_cq_data
 	uint16_t msg_seq_num = GIN_IMM_GET_SEQ_NUM(cq_entry->data);
 	bool is_ack_requested = GIN_IMM_GET_ACK_REQUESTED(cq_entry->data);
 
-	uint32_t peer_rank = get_peer_rank(src_addr, rank_map[rail_id]);
+	const uint64_t peer_rank_value = endpoint_mr ? (cq_entry->data >> 32)
+						     : get_peer_rank(src_addr, rank_map[rail_id]);
+	if (OFI_UNLIKELY(!gin_peer_rank_is_valid(peer_rank_value, nranks))) {
+		NCCL_OFI_WARN("Invalid GIN write source rank %llu (nranks=%d) on rail %u",
+			      static_cast<unsigned long long>(peer_rank_value), nranks, rail_id);
+		return -EINVAL;
+	}
+	const uint32_t peer_rank = static_cast<uint32_t>(peer_rank_value);
 
 	NCCL_OFI_TRACE_GIN_HANDLE_SIGNAL_WRITE_COMPLETION_FUNC_START(dev, this, rail_id, peer_rank,
 								     msg_seq_num, total_segms,

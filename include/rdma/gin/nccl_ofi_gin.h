@@ -66,7 +66,7 @@ public:
 };
 
 /**
- * Resource releaser for shared GIN resources.
+ * Resource releaser, just to make sure it is cleaned up properly.
  */
 struct nccl_ofi_gin_resource_releaser {
 	explicit nccl_ofi_gin_resource_releaser(nccl_ofi_gin_resources &resources_arg)
@@ -74,11 +74,16 @@ struct nccl_ofi_gin_resource_releaser {
 	{
 	}
 
-	void activate() { active = true; }
+	void activate()
+	{
+		active = true;
+	}
 
 	~nccl_ofi_gin_resource_releaser()
 	{
-		if (active) { resources.release(); }
+		if (active) {
+			resources.release();
+		}
 	}
 
 	nccl_ofi_gin_resources &resources;
@@ -568,12 +573,19 @@ public:
 	 * @param src_addr: source address of the ACK sender
 	 * @param rail_id: rail on which the ACK was received
 	 */
-	int handle_ack_completion(const gin_ack_msg_t *ack_msg, fi_addr_t src_addr,
+	int handle_ack_completion(const gin_ack_msg *ack_msg, fi_addr_t src_addr,
 				  uint16_t rail_id);
 
 private:
 	/* Member layout is ordered by access frequency (higher to lower). */
 	/* --- TIER 1: every iputSignal + every CQ completion --- */
+	/* Shared ownership of the endpoint's GIN resources. The resources are
+	   destroyed once the last comm on the endpoint drops this reference;
+	   the GIN resources registry (see gin_resources_registry) then drops its slot
+	   for that endpoint. Declared first so it is destroyed last, after the
+	   members below whose destructors need the resources/endpoint alive.
+	   Access via get_resources(); the shared_ptr deref is free under
+	   optimization, so there is no separate reference member to keep in sync. */
 	std::shared_ptr<nccl_ofi_gin_resources> resources_sp;
 	nccl_ofi_gin_resource_releaser resource_releaser;
 	std::unique_ptr<gin_flow_policy> flow_policy;
@@ -651,7 +663,7 @@ private:
 	 * @param peer_rank rank to send the acknowledgement to
 	 * @param ack_msg prepared ACK payload
 	 */
-	int send_ack(uint32_t peer_rank, const gin_ack_msg_t &ack_msg)
+	int send_ack(uint32_t peer_rank, const gin_ack_msg &ack_msg)
 		REQUIRES(get_ep_lock());
 
 	/* Update the pinned-rail state after an op posted on `rail_id`:

@@ -42,13 +42,13 @@ int gin_flow_posted_recv::prepare_tx(
 
 void gin_flow_posted_recv::prepare_ack(
 	const nccl_ofi_gin_peer_rank_info &peer,
-	uint32_t rx_consumed, gin_ack_msg_t &ack)
+	uint32_t rx_consumed, gin_ack_msg &ack)
 {
 	gin_fill_ack_header(peer, rx_consumed, ack);
 }
 
 void gin_flow_posted_recv::process_ack(
-	nccl_ofi_gin_peer_rank_info &peer, const gin_ack_msg_t &ack)
+	nccl_ofi_gin_peer_rank_info &peer, const gin_ack_msg &ack)
 {
 	gin_complete_pending_ack_request(peer, ack.rx_consumed);
 }
