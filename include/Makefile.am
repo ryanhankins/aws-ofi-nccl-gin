@@ -13,6 +13,7 @@ noinst_HEADERS = \
 	rdma/gin/nccl_ofi_gin_allgather.h \
 	rdma/gin/nccl_ofi_gin_api.h \
 	rdma/gin/nccl_ofi_gin_close_progress.h \
+	rdma/gin/nccl_ofi_gin_comm_id_pool.h \
 	rdma/gin/nccl_ofi_gin_flow_posted_recv.h \
 	rdma/gin/nccl_ofi_gin_flow_writedata_routed.h \
 	rdma/gin/nccl_ofi_gin_reqs.h \

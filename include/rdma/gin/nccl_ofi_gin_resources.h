@@ -17,6 +17,7 @@
 #include <unordered_map>
 
 #include "rdma/gin/nccl_ofi_gin_reqs.h"
+#include "rdma/gin/nccl_ofi_gin_comm_id_pool.h"
 #include "rdma/gin/nccl_ofi_gin_types.h"
 #include "nccl_ofi_gin_base.h"
 #include "nccl_ofi_freelist.h"
@@ -400,7 +401,12 @@ public:
 
 	size_t alloc_comm_id()
 	{
-		return comm_id_pool.allocate_id();
+		return comm_id_pool.allocate();
+	}
+
+	void rollback_unpublished_comm_id(size_t id)
+	{
+		comm_id_pool.rollback_unpublished(id);
 	}
 
 	nccl_ofi_freelist *get_ack_send_fl()
@@ -549,7 +555,7 @@ private:
 	nccl_ofi_gin_mr_handle_t *flush_buff_gpu_mr_handle = nullptr;
 
 	/* === Tier 3 — accessed only at connect/disconnect time === */
-	nccl_ofi_idpool_t comm_id_pool;
+	nccl_ofi_gin_comm_id_pool comm_id_pool;
 
 	/* Number of associated comms */
 	size_t ref_cnt = 0;

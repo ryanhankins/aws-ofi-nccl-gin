@@ -47,8 +47,7 @@ nccl_ofi_rdma_gin_put_comm::nccl_ofi_rdma_gin_put_comm(std::shared_ptr<nccl_ofi_
       rank(rank_), nranks(nranks_),
       ag_comm(s_comm_, r_comm_, rank_, nranks_)
 {
-	auto &resources = get_resources();
-	auto &ep = resources.get_ep();
+	auto &ep = get_resources().get_ep();
 
 	std::lock_guard scoped_ep_lock(ep.ep_lock);
 
@@ -59,61 +58,78 @@ nccl_ofi_rdma_gin_put_comm::nccl_ofi_rdma_gin_put_comm(std::shared_ptr<nccl_ofi_
 
 	metadata_fl.reset(metadata_fl_ptr);
 
-#if HAVE_NVTX_TRACING
-	if (ofi_nccl_nvtx_trace_dimension() == NVTX_TRACE_DIMENSION::PER_COMM) {
-		for (int i = 0; i < NCCL_OFI_N_NVTX_DOMAIN_PER_COMM; ++i) {
-			char name[64];
-			snprintf(name, 64, "aws-ofi-nccl gin_comm %p_%d", this, i);
-			this->nvtx_domain[i] = nvtxDomainCreateA(name);
-		}
-	}
-#endif
-
-	size_t comm_id = get_resources().alloc_comm_id(); /* TODO free */
+	size_t comm_id = get_resources().alloc_comm_id();
 	if (OFI_UNLIKELY(comm_id == FI_KEY_NOTAVAIL)) {
-		NCCL_OFI_WARN("No comm id available");
-		throw std::runtime_error("No comm id available");
+		NCCL_OFI_WARN("No GIN communicator IDs remain for this endpoint resource lifetime");
+		throw std::runtime_error("No GIN communicator IDs remain for this "
+					"endpoint resource lifetime");
 	}
-	this->local_comm_id = comm_id;
-	flow_policy = resources.get_ep().make_flow_policy(resources, nranks);
-	flow_ctx.conservative_refresh_window = 1;
-	flow_ctx.progress_comm = this;
-	flow_ctx.progress_fn = gin_flow_progress_tx;
+	this->local_comm_id = static_cast<uint32_t>(comm_id);
+	auto &resources = get_resources();
+	bool comm_registered = false;
+	bool ref_counted = false;
+	try {
+#if HAVE_NVTX_TRACING
+		if (ofi_nccl_nvtx_trace_dimension() == NVTX_TRACE_DIMENSION::PER_COMM) {
+			for (int i = 0; i < NCCL_OFI_N_NVTX_DOMAIN_PER_COMM; ++i) {
+				char name[64];
+				snprintf(name, 64, "aws-ofi-nccl gin_comm %p_%d", this, i);
+				this->nvtx_domain[i] = nvtxDomainCreateA(name);
+			}
+		}
+#endif
+		flow_policy = resources.get_ep().make_flow_policy(resources, nranks);
+		flow_ctx.conservative_refresh_window = 1;
+		flow_ctx.progress_comm = this;
+		flow_ctx.progress_fn = gin_flow_progress_tx;
 
-	get_resources().set_comm(local_comm_id, *this);
+		resources.set_comm(local_comm_id, *this);
+		comm_registered = true;
 
 #if HAVE_CUDA
-	/* Capture the app's context on this context-bearing thread so discovery
-	 * can rebind it on NCCL's context-less GIN progress thread. The app owns
-	 * it and it outlives this comm. */
-	if (nccl_net_ofi_gpu_get_current_context(&gdrcopy_cuda_ctx) != 0 ||
-	    gdrcopy_cuda_ctx == nullptr) {
-		NCCL_OFI_WARN("Could not capture a CUDA context; GPU signal "
-			      "delivery may fail");
-		gdrcopy_cuda_ctx = nullptr;
-	}
+		/* Capture the app's context on this context-bearing thread so discovery
+		 * can rebind it on NCCL's context-less GIN progress thread. The app owns
+		 * it and it outlives this comm. */
+		if (nccl_net_ofi_gpu_get_current_context(&gdrcopy_cuda_ctx) != 0 ||
+		    gdrcopy_cuda_ctx == nullptr) {
+			NCCL_OFI_WARN("Could not capture a CUDA context; "
+			       "GPU signal delivery may fail");
+			gdrcopy_cuda_ctx = nullptr;
+		}
 #endif
 
-	/* Ensure the single process-wide gdrcopy worker exists. It is spawned
-	 * lazily on the first comm and runs until process teardown; later comms
-	 * just attach to it. A spawn failure (thread/FD exhaustion) is fatal:
-	 * rather than silently fall back to running gdrcopy on the proxy thread,
-	 * fail comm creation so we never run in that degraded configuration.
-	 * Undo the comm registration before rethrowing so resources teardown
-	 * does not see a dangling comm. */
-	try {
-		(void)nccl_ofi_gin_gdrcopy_worker::get();
-	} catch (const std::exception &err) {
-		NCCL_OFI_WARN("Failed to start GIN gdrcopy worker: %s", err.what());
-		get_resources().remove_comm(local_comm_id);
-		throw;
-	}
+		/* The worker is process-wide and outlives every GIN comm. */
+		try {
+			(void)nccl_ofi_gin_gdrcopy_worker::get();
+		} catch (const std::exception &err) {
+			NCCL_OFI_WARN("Failed to start GIN gdrcopy worker: %s", err.what());
+			throw;
+		}
 
-	resources.increment_ref_cnt();
-	resource_releaser.activate();
-	rank_comms.resize(nranks);
-	for (auto &peer : rank_comms) {
-		flow_policy->init_peer(peer, nranks);
+		ref_counted = true;
+		resources.increment_ref_cnt();
+		rank_comms.resize(nranks);
+		for (auto &peer : rank_comms) {
+			flow_policy->init_peer(peer, nranks);
+		}
+		resource_releaser.activate();
+	} catch (...) {
+		if (comm_registered) {
+			resources.remove_comm(local_comm_id);
+		}
+		if (ref_counted) {
+			resources.release();
+		}
+		resources.rollback_unpublished_comm_id(comm_id);
+#if HAVE_NVTX_TRACING
+		for (int i = 0; i < NCCL_OFI_N_NVTX_DOMAIN_PER_COMM; ++i) {
+			if (this->nvtx_domain[i] != nullptr) {
+				nvtxDomainDestroy(this->nvtx_domain[i]);
+				this->nvtx_domain[i] = nullptr;
+			}
+		}
+#endif
+		throw;
 	}
 }
 
