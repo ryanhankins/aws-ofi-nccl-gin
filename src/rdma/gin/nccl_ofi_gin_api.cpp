@@ -141,20 +141,13 @@ ncclResult_t nccl_ofi_gin_listen(void *ctx, int dev, void *handle, void **listen
 		return ncclInternalError;
 	}
 
-	/* Bucket connections across endpoints by their owning GIN progress
-	   thread, so each progress thread drives its own endpoint instead of
-	   contending on a shared completion queue.
-
-	   NCCL calls listen() ginCommCount times (once per collComm).
-	   listen_seq % NCCL_GIN_PROXY_NTHREADS maps each connection to its
-	   owning thread's endpoint:
-	   - When ginCommCount == NTHREADS (typical): each listen gets a unique
-	     thread_idx, yielding one dedicated EP per thread.
-	   - When ginCommCount > NTHREADS: multiple connections share an EP
-	     (thread t round-robins connections t, t+T, t+2T, ... and they all
-	     land on the same endpoint_key).
-	   - NCCL_GIN_PROXY_NTHREADS=1 (default): all connections share the
-	     single per-init seq endpoint (legacy behavior). */
+	/* Keep plugin endpoint bucketing aligned with NCCL's proxy ownership:
+	   nccl/src/gin/gin_host.cc drives commIdx t, t+proxyNthreads, ... on
+	   proxy thread t, and listen() is called once per commIdx in that same
+	   sequence. Because both sides key off NCCL_GIN_PROXY_NTHREADS, this
+	   listen_seq % nthreads bucket must stay in lock-step with NCCL's
+	   commIdx % proxyNthreads partitioning or shared-endpoint flow-control
+	   state will corrupt silently. */
 	const int listen_seq = context->listen_count++;
 	int thread_idx = listen_seq % context->nthreads;
 

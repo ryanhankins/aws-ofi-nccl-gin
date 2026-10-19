@@ -36,15 +36,19 @@ struct gin_connect_handle {
 	nccl_ofi_addr ep_names[MAX_NUM_RAILS];
 };
 
+static inline int gin_flow_progress_tx(nccl_ofi_rdma_gin_put_comm &comm);
+
 nccl_ofi_rdma_gin_put_comm::nccl_ofi_rdma_gin_put_comm(std::shared_ptr<nccl_ofi_gin_resources> resources_arg, int rank_, int nranks_,
 				     nccl_net_ofi_send_comm *s_comm_,
 				     nccl_net_ofi_recv_comm *r_comm_)
     : resources_sp(std::move(resources_arg)),
+      resource_releaser(*resources_sp),
       metadata_fl(nullptr, &freelist_deleter), dev(s_comm_->dev_id),
       rank(rank_), nranks(nranks_),
       ag_comm(s_comm_, r_comm_, rank_, nranks_)
 {
-	auto &ep = get_resources().get_ep();
+	auto &resources = get_resources();
+	auto &ep = resources.get_ep();
 
 	std::lock_guard scoped_ep_lock(ep.ep_lock);
 
@@ -71,6 +75,10 @@ nccl_ofi_rdma_gin_put_comm::nccl_ofi_rdma_gin_put_comm(std::shared_ptr<nccl_ofi_
 		throw std::runtime_error("No comm id available");
 	}
 	this->local_comm_id = comm_id;
+	flow_policy = resources.get_ep().make_flow_policy(resources, nranks);
+	flow_ctx.conservative_refresh_window = 1;
+	flow_ctx.progress_comm = this;
+	flow_ctx.progress_fn = gin_flow_progress_tx;
 
 	get_resources().set_comm(local_comm_id, *this);
 
@@ -99,6 +107,13 @@ nccl_ofi_rdma_gin_put_comm::nccl_ofi_rdma_gin_put_comm(std::shared_ptr<nccl_ofi_
 		NCCL_OFI_WARN("Failed to start GIN gdrcopy worker: %s", err.what());
 		get_resources().remove_comm(local_comm_id);
 		throw;
+	}
+
+	resources.increment_ref_cnt();
+	resource_releaser.activate();
+	rank_comms.resize(nranks);
+	for (auto &peer : rank_comms) {
+		flow_policy->init_peer(peer, nranks);
 	}
 }
 
@@ -198,7 +213,8 @@ int nccl_ofi_rdma_gin_listen_comm::connect(nccl_net_ofi_conn_handle_t *handles[]
 
 	/* Look up (or create on first use) the GIN resources for this endpoint.
 	   GIN owns this association; the net endpoint does not know about GIN. */
-	std::shared_ptr<nccl_ofi_gin_resources> resources = gin_resources_registry().get(ep);
+	std::shared_ptr<nccl_ofi_gin_resources> resources =
+		gin_resources_registry().get(ep, nranks);
 
 	nccl_ofi_rdma_gin_put_comm *gin_comm =
 		new nccl_ofi_rdma_gin_put_comm(resources, rank, nranks, s_comm, r_comm);
@@ -216,8 +232,6 @@ int nccl_ofi_rdma_gin_listen_comm::connect(nccl_net_ofi_conn_handle_t *handles[]
 	for (int i = 0; i < num_rails; ++i) {
 		set_rail_address(gin_ep.get_rail(i), my_gin_handle.ep_names[i]);
 	}
-
-	gin_comm->rank_comms.resize(nranks);
 
 	/* Pre-allocate rank_map vectors for direct fi_addr_t indexing.
 	 * UINT32_MAX serves as "not populated" sentinel. */
@@ -259,18 +273,16 @@ int nccl_ofi_rdma_gin_listen_comm::connect(nccl_net_ofi_conn_handle_t *handles[]
 	return 0;
 }
 
-int nccl_ofi_rdma_gin_put_comm::send_ack(nccl_ofi_rdma_gin_put_comm &gin_comm, uint32_t peer_rank,
-			       uint32_t rx_consumed)
+int nccl_ofi_rdma_gin_put_comm::send_ack(uint32_t peer_rank, const gin_ack_msg_t &ack_msg)
 {
 	/* For now, always send acks on rail 0.
 	   TODO round-robin this like the payload data itself. */
 	const int rail_id = 0;
 
-	auto &rank_comm = gin_comm.rank_comms[peer_rank];
-	uint32_t peer_comm_id = rank_comm.comm_id;
+	auto &rank_comm = rank_comms[peer_rank];
 
-	auto &ep = gin_comm.get_resources().get_ep();
-	auto *ack_fl = gin_comm.get_resources().get_ack_send_fl();
+	auto &ep = get_resources().get_ep();
+	auto *ack_fl = get_resources().get_ack_send_fl();
 
 	auto *ack_elem = ack_fl->entry_alloc();
 	if (!ack_elem) {
@@ -278,32 +290,29 @@ int nccl_ofi_rdma_gin_put_comm::send_ack(nccl_ofi_rdma_gin_put_comm &gin_comm, u
 		return -ENOMEM;
 	}
 
-	auto *ack_msg = static_cast<gin_ack_msg_t *>(ack_elem->ptr);
-	*ack_msg = {};
-	ack_msg->msg_type = GIN_MSG_TYPE_ACK;
-	ack_msg->ack_comm_id = static_cast<uint16_t>(peer_comm_id);
-	ack_msg->rx_consumed = rx_consumed & GIN_RX_CONSUMED_MASK;
+	auto *ack_buf = static_cast<gin_ack_msg_t *>(ack_elem->ptr);
+	*ack_buf = ack_msg;
 
 	auto *ofi_ep = ep.get_rail(rail_id).ofi_ep.get();
 
 	nccl_net_ofi_gin_sendack_req_t *req;
 	try {
-		req = gin_comm.get_resources().get_req_from_pool<nccl_net_ofi_gin_sendack_req_t>(
-			gin_comm, ofi_ep, rail_id, ack_elem,
+		req = get_resources().get_req_from_pool<nccl_net_ofi_gin_sendack_req_t>(
+			*this, ofi_ep, rail_id, ack_elem,
 			rank_comm.address[rail_id], ack_fl);
 	} catch (...) {
 		ack_fl->entry_free(ack_elem);
 		throw;
 	}
 
-	NCCL_OFI_TRACE_GIN_ACK_SEND(dev, rail_id, &gin_comm, peer_rank, rx_consumed);
+	NCCL_OFI_TRACE_GIN_ACK_SEND(dev, rail_id, this, peer_rank, ack_msg.rx_consumed);
 
 	int ret = req->post();
 	if (ret == -FI_EAGAIN) {
-		gin_comm.get_resources().add_pending_req(req);
+		get_resources().add_pending_req(req);
 		ret = 0;
 	} else if (ret != 0) {
-		gin_comm.get_resources().return_req_to_pool(req);
+		get_resources().return_req_to_pool(req);
 	}
 
 	return ret;
@@ -559,63 +568,6 @@ int nccl_ofi_rdma_gin_put_comm::await_pending_requests()
 	return ret;
 }
 
-/* Per-peer cap on un-ACKed ops. On endpoint-MR providers (CXI) every
- * remote write with immediate data posts one event to a fixed-size target
- * control event queue (64 KiB by default, ~1024 events) that is only drained
- * when the target progresses. If it overflows the NIC fails the writes with
- * ENTRY_NOT_FOUND. Because the cursors count ops until the receiver has
- * consumed them (ACKs carry rx_consumed), bounding outstanding ops bounds the
- * queue occupancy: keep the sum over peers under GIN_EQ_EVENT_BUDGET.
- * Other providers keep the full sequence window. */
-#define GIN_EQ_EVENT_BUDGET 384
-#define GIN_MIN_TX_WINDOW 32
-
-/* Smallest write that shares its doorbell with the paired metadata send (CXI) */
-#define GIN_CXI_PAIR_DOORBELL_MIN (64 * 1024)
-
-static inline uint32_t gin_tx_window(int nranks)
-{
-	uint32_t full = GIN_IMM_SEQ_MASK + 1;
-	if (!endpoint_mr) {
-		return full;
-	}
-	uint32_t w = GIN_EQ_EVENT_BUDGET / (uint32_t)std::max(1, nranks - 1);
-	return std::min(full, std::max<uint32_t>(GIN_MIN_TX_WINDOW, w));
-}
-
-/* ACK request policy for a given window: ask once half full, then every
- * interval ops. The interval must fit well inside the half-window. */
-static inline uint32_t gin_ack_threshold(uint32_t window)
-{
-	return window / 2;
-}
-
-static inline uint32_t gin_ack_interval(uint32_t window)
-{
-	return std::min<uint32_t>(GIN_ACK_INTERVAL, std::max<uint32_t>(1, window / 8));
-}
-
-int nccl_ofi_rdma_gin_put_comm::await_tx_window(nccl_ofi_gin_peer_rank_info &rank_comm)
-{
-	uint32_t outstanding = gin_cursor_delta(rank_comm.tx_head, rank_comm.tx_tail);
-	while (OFI_UNLIKELY(outstanding >= gin_tx_window(nranks))) {
-		{
-			std::lock_guard<std::mutex> lock(get_ep_lock());
-			int ret = get_resources().progress();
-			if (OFI_UNLIKELY(ret != 0)) {
-				return ret;
-			}
-			ret = drain_gdrcopy_done_queue();
-			if (OFI_UNLIKELY(ret != 0)) {
-				return ret;
-			}
-		}
-		std::this_thread::yield();
-		outstanding = gin_cursor_delta(rank_comm.tx_head, rank_comm.tx_tail);
-	}
-	return 0;
-}
-
 static inline void clear_write_reqs_pending_back_pointers(
 	std::array<nccl_net_ofi_gin_write_req_t *, MAX_NUM_RAILS> &write_reqs)
 {
@@ -665,40 +617,21 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 
 	auto &gin_ep = get_resources().get_ep();
 	auto &rank_comm = rank_comms[dst_rank];
-	uint16_t msg_seq_num = rank_comm.tx_head & GIN_IMM_SEQ_MASK;
 	uint32_t remote_comm_id = rank_comm.comm_id;
 	auto scheduler = gin_ep.get_scheduler();
 	/* Rail for this op's write(s) and metadata send; assigned in the
 	   size branch below (both size>0 and signal-only paths set it). */
 	uint16_t rail_id;
 
-	/* Wait for a free slot in the TX window if full. */
-	{
-		int ret = await_tx_window(rank_comm);
-		if (OFI_UNLIKELY(ret != 0))
-			return ret;
+	gin_tx_flow_decision flow = {};
+	int ret = flow_policy->prepare_tx(rank_comm, flow, flow_ctx);
+	if (OFI_UNLIKELY(ret != 0)) {
+		return ret;
 	}
 
-	/* Determine if this message needs an ACK.
-	 *
-	 * Same policy for SIGNAL, PUT-SIGNAL, and PUT-only: ask the receiver
-	 * to emit a standalone ACK once the outstanding window is at least
-	 * half full, and only every GIN_ACK_INTERVAL'th op above that
-	 * threshold (hysteresis -- otherwise we'd request an ACK on every op
-	 * once above 50% and flood the receiver with standalone ACKs). Once
-	 * an ACK arrives, tx_tail jumps forward and outstanding drops back
-	 * below the threshold, resetting the gate. */
 	bool has_signal = (signalOp != 0);
-	bool is_ack_requested = false;
-	const uint32_t outstanding = gin_cursor_delta(rank_comm.tx_head, rank_comm.tx_tail);
-
-	const uint32_t tx_window = gin_tx_window(nranks);
-	if (OFI_UNLIKELY(outstanding >= gin_ack_threshold(tx_window))) {
-		if (OFI_UNLIKELY(rank_comm.consecutive_puts_without_ack++ >= gin_ack_interval(tx_window))) {
-			is_ack_requested = true;
-			rank_comm.consecutive_puts_without_ack = 0;
-		}
-	}
+	bool is_ack_requested = flow.request_ack;
+	uint16_t msg_seq_num = rank_comm.tx_head & GIN_IMM_SEQ_MASK;
 
 	std::lock_guard<std::mutex> scoped_ep_lock(get_ep_lock());
 
@@ -752,7 +685,7 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 	/* Hold write_reqs for error clean up */
 	std::array<nccl_net_ofi_gin_write_req_t *, MAX_NUM_RAILS> write_reqs {};
 
-	int ret = 0;
+	ret = 0;
 
 	NCCL_OFI_TRACE_GIN_IPUT_SIGNAL_BEGIN(dev, size, this, dst_rank, msg_seq_num, req);
 
@@ -1108,6 +1041,20 @@ static inline uint32_t get_peer_rank(fi_addr_t src_addr,
 static inline uint64_t get_req_map_key(uint32_t peer_rank, uint16_t msg_seq_num)
 {
 	return (static_cast<uint64_t>(peer_rank) << 16) | static_cast<uint64_t>(msg_seq_num);
+}
+
+static inline int gin_flow_progress_tx(nccl_ofi_rdma_gin_put_comm &comm)
+{
+	std::lock_guard<std::mutex> lock(comm.get_ep_lock());
+	int ret = comm.get_resources().progress();
+	if (OFI_UNLIKELY(ret != 0)) {
+		return ret;
+	}
+	ret = comm.drain_gdrcopy_done_queue();
+	if (OFI_UNLIKELY(ret != 0)) {
+		return ret;
+	}
+	return 0;
 }
 
 signal_seg_t *nccl_ofi_rdma_gin_put_comm::find_signal_seg(
@@ -1713,9 +1660,9 @@ int nccl_ofi_rdma_gin_put_comm::iput_signal_recv_req_completion(uint32_t peer_ra
 /* Receiver-side ACK emission. Called from the metadata/write CQ handlers
    after rx_consumed has been advanced by retire_completed_peer_iput_ops.
 
-   Emits a standalone ACK only when the sender explicitly requested one
-   (the ack_req bit was set in either the data immediate or the metadata
-   header for any of this peer's in-flight ops). */
+   Emits a standalone ACK only when the sender requested one. The grant is
+   a fixed worst-case communicator share so the sum of all valid per-peer
+   grants can never outrun the receiver CQ budget as fan-in changes. */
 int nccl_ofi_rdma_gin_put_comm::maybe_send_ack(uint32_t peer_rank, bool sender_requested)
 {
 	if (!sender_requested) {
@@ -1723,7 +1670,9 @@ int nccl_ofi_rdma_gin_put_comm::maybe_send_ack(uint32_t peer_rank, bool sender_r
 	}
 
 	auto &rank_comm = this->rank_comms[peer_rank];
-	int ret = send_ack(*this, peer_rank, rank_comm.rx_consumed);
+	gin_ack_msg_t ack_msg = {};
+	flow_policy->prepare_ack(rank_comm, rank_comm.rx_consumed, ack_msg);
+	int ret = send_ack(peer_rank, ack_msg);
 	if (OFI_UNLIKELY(ret != 0)) {
 		return ret;
 	}
@@ -1979,14 +1928,7 @@ int nccl_ofi_rdma_gin_put_comm::handle_ack_completion(const gin_ack_msg_t *ack_m
 	   arriving after newer ones are no-ops because they don't move
 	   tx_tail forward. */
 	apply_rx_consumed(peer_rank, rx_consumed);
-	auto &rank_comm = rank_comms[peer_rank];
-	if (rank_comm.has_pending_ack_request) {
-		uint32_t delta = gin_cursor_delta(rx_consumed,
-						  rank_comm.last_ack_requested_seq);
-		if (delta <= GIN_RX_CONSUMED_HALF) {
-			rank_comm.has_pending_ack_request = false;
-		}
-	}
+	flow_policy->process_ack(rank_comms[peer_rank], *ack_msg);
 
 	NCCL_OFI_TRACE_GIN_HANDLE_ACK_COMPLETION_FUNC_END(dev, this, rail_id, peer_rank,
 						  rx_consumed, 0);

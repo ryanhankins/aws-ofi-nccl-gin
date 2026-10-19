@@ -5,12 +5,16 @@
 #include "config.h"
 
 #include "rdma/gin/nccl_ofi_gin_resources.h"
+#include "rdma/gin/nccl_ofi_gin.h"
 #include "rdma/gin/nccl_ofi_gin_reqs.h"
 #include "rdma/gin/nccl_ofi_gin_gdaki.h"
+#include "rdma/gin/nccl_ofi_gin_flow_posted_recv.h"
+#include "rdma/gin/nccl_ofi_gin_flow_writedata_routed.h"
 
 #include "nccl_ofi_assert.h"
 #include <cinttypes>
 #include <cstdlib>
+#include <thread>
 #if HAVE_CUDA
 #include "nccl_ofi_cuda.h"
 #endif
@@ -22,7 +26,7 @@
 #include "nccl_ofi_log.h"
 
 std::shared_ptr<nccl_ofi_gin_resources>
-nccl_ofi_gin_resources_registry::get(const std::shared_ptr<nccl_net_ofi_ep_t> &ep)
+nccl_ofi_gin_resources_registry::get(const std::shared_ptr<nccl_net_ofi_ep_t> &ep, uint32_t nranks)
 {
 	std::lock_guard<std::mutex> guard(lock);
 
@@ -33,7 +37,7 @@ nccl_ofi_gin_resources_registry::get(const std::shared_ptr<nccl_net_ofi_ep_t> &e
 		}
 	}
 
-	auto resources = std::make_shared<nccl_ofi_gin_resources>(ep);
+	auto resources = std::make_shared<nccl_ofi_gin_resources>(ep, nranks);
 	by_ep[ep.get()] = resources;
 	return resources;
 }
@@ -51,7 +55,11 @@ nccl_ofi_gin_resources_registry &gin_resources_registry()
 }
 static inline struct fi_info *get_gin_info(struct fi_info *info);
 
-nccl_ofi_rdma_gin_ep_t::nccl_ofi_rdma_gin_ep_t(nccl_net_ofi_domain_t &domain_arg) : domain(domain_arg)
+nccl_ofi_rdma_gin_ep_t::nccl_ofi_rdma_gin_ep_t(nccl_net_ofi_domain_t &domain_arg,
+				       uint32_t cq_sizing_nranks_arg)
+	: domain(domain_arg),
+	  configured_rx_cq_size(0),
+	  cq_sizing_nranks(cq_sizing_nranks_arg)
 {
 	/*
 	 * Determine once, at construction, whether this provider negotiated
@@ -61,7 +69,8 @@ nccl_ofi_rdma_gin_ep_t::nccl_ofi_rdma_gin_ep_t(nccl_net_ofi_domain_t &domain_arg
 	 * differs by provider.
 	 */
 	ofi_info_ptr gin_info(get_gin_info(domain.get_device()->get_ofi_info(0)));
-	if (gin_info->mode & FI_RX_CQ_DATA) {
+	uses_posted_recv_flow = gin_info->mode & FI_RX_CQ_DATA;
+	if (uses_posted_recv_flow) {
 		process_completions_impl =
 			&nccl_ofi_rdma_gin_ep_t::gin_process_completions_posted_recv;
 	} else {
@@ -69,6 +78,30 @@ nccl_ofi_rdma_gin_ep_t::nccl_ofi_rdma_gin_ep_t(nccl_net_ofi_domain_t &domain_arg
 			&nccl_ofi_rdma_gin_ep_t::gin_process_completions_writedata_routed;
 	}
 
+	bool cq_was_auto_sized = false;
+	bool cq_was_auto_capped = false;
+	uint32_t cq_effective_window = 0;
+	const size_t cq_size_floor = ofi_nccl_cq_size();
+	this->rx_cq_reserve_margin = ofi_nccl_gin_rx_cq_reserve_margin();
+	if (uses_posted_recv_flow) {
+		/* Posted-recv providers do not route windowing through CQ grants, so
+		 * preserve the plain OFI_NCCL_CQ_SIZE floor rather than applying the
+		 * CXI-only auto-sizing heuristic. */
+		configured_rx_cq_size = cq_size_floor;
+	} else {
+		const auto cq_diagnostics =
+			gin_compute_cq_sizing_diagnostics(cq_size_floor, cq_sizing_nranks,
+						 rx_cq_reserve_margin);
+		configured_rx_cq_size = cq_diagnostics.configured_size;
+		cq_was_auto_sized = cq_diagnostics.was_auto_sized;
+		cq_was_auto_capped = cq_diagnostics.was_auto_capped;
+		cq_effective_window = cq_diagnostics.effective_window;
+	}
+
+	const size_t requested_rx_cq_size = configured_rx_cq_size;
+	/* The CQ-safety invariant below depends on the provider honoring this
+	 * requested fi_cq_attr.size. libfabric offers no standard post-open query
+	 * to verify the realized depth, so we size grants from the request itself. */
 	this->num_rails = domain.get_ofi_num_rails();
 	this->cq_process_max_iter = ofi_nccl_gin_cq_process_max_iter();
 	assert_always(this->num_rails > 0);
@@ -80,9 +113,22 @@ nccl_ofi_rdma_gin_ep_t::nccl_ofi_rdma_gin_ep_t(nccl_net_ofi_domain_t &domain_arg
 	 * rails 1..N-1 need their own get_gin_info() call. This turns what
 	 * was an N+1 fi_getinfo() call sequence into N.
 	 */
-	rails.emplace_back(uint16_t{0}, domain, std::move(gin_info));
+	rails.emplace_back(uint16_t{0}, domain, requested_rx_cq_size, std::move(gin_info));
 	for (uint16_t r = 1; r < this->num_rails; r++) {
-		rails.emplace_back(r, domain);
+		rails.emplace_back(r, domain, requested_rx_cq_size);
+	}
+	if (cq_was_auto_sized) {
+		NCCL_OFI_INFO(
+			NCCL_NET, "GIN auto-sized RX CQ from %zu to %zu entries "
+			"for nranks=%u (target window=%u)",
+			      cq_size_floor, requested_rx_cq_size, cq_sizing_nranks,
+			      GIN_TARGET_GRANTED_WINDOW);
+	}
+	if (cq_was_auto_capped) {
+		NCCL_OFI_WARN("GIN auto-sized RX CQ capped at %zu entries for nranks=%u; worst-case window=%u remains below target %u",
+			      configured_rx_cq_size, cq_sizing_nranks,
+			      cq_effective_window,
+			      GIN_TARGET_GRANTED_WINDOW);
 	}
 	this->scheduler = new nccl_net_ofi_threshold_scheduler(this->num_rails);
 }
@@ -93,6 +139,15 @@ nccl_ofi_rdma_gin_ep_t::~nccl_ofi_rdma_gin_ep_t()
 		delete scheduler;
 		scheduler = nullptr;
 	}
+}
+
+std::unique_ptr<gin_flow_policy> nccl_ofi_rdma_gin_ep_t::make_flow_policy(
+	nccl_ofi_gin_resources &resources, uint32_t nranks) const
+{
+	if (uses_posted_recv_flow) {
+		return std::make_unique<gin_flow_posted_recv>();
+	}
+	return std::make_unique<gin_flow_writedata_routed>(resources, nranks);
 }
 
 int nccl_ofi_rdma_gin_ep_t::dispatch_via_op_context(struct fi_cq_data_entry *cq_entry,
@@ -499,7 +554,8 @@ static inline struct fi_info *get_gin_info(struct fi_info *info)
 }
 
 nccl_ofi_gin_ep_rail_t::nccl_ofi_gin_ep_rail_t(uint16_t rail_id_, nccl_net_ofi_domain_t &domain,
-					      ofi_info_ptr &&cached_gin_info)
+			      size_t configured_rx_cq_size,
+			      ofi_info_ptr &&cached_gin_info)
     : rail_id(rail_id_)
 {
 	ofi_domain_ptr &ofi_domain = domain.get_ofi_domain(rail_id);
@@ -507,7 +563,7 @@ nccl_ofi_gin_ep_rail_t::nccl_ofi_gin_ep_rail_t(uint16_t rail_id_, nccl_net_ofi_d
 	/* Create cq */
 	fi_cq_attr cq_attr = {};
 	cq_attr.format = FI_CQ_FORMAT_DATA;
-	cq_attr.size = ofi_nccl_cq_size();
+	cq_attr.size = configured_rx_cq_size;
 	auto cq_result = nccl_ofi_ofiutils_cq_create(ofi_domain, &cq_attr);
 	if (OFI_UNLIKELY(cq_result.is_failure())) {
 		NCCL_OFI_WARN("Couldn't open CQ. RC: %d, ERROR: %s", cq_result.error_code,
@@ -581,9 +637,9 @@ void nccl_ofi_gin_resources::post_rx_buffs_on_rail(nccl_ofi_gin_ep_rail_t &rail,
 	}
 }
 
-nccl_ofi_gin_resources::nccl_ofi_gin_resources(const std::shared_ptr<nccl_net_ofi_ep_t> &ep_arg)
+nccl_ofi_gin_resources::nccl_ofi_gin_resources(const std::shared_ptr<nccl_net_ofi_ep_t> &ep_arg, uint32_t nranks)
     : ep_holder(ep_arg),
-      gin_ep(ep_arg->get_domain()),
+      gin_ep(ep_arg->get_domain(), nranks),
       dev(ep_arg->get_domain().get_device()->dev_id),
       req_fl(nullptr, &freelist_deleter),
       rx_buff_fl(nullptr, &freelist_deleter),
@@ -631,6 +687,69 @@ nccl_ofi_gin_resources::nccl_ofi_gin_resources(const std::shared_ptr<nccl_net_of
 	this->req_fl.reset(req_fl_tmp);
 
 	init_flush_buffers(num_rails);
+}
+
+uint32_t nccl_ofi_gin_resources::get_shared_cq_window_limit(uint32_t nranks) const
+{
+	return gin_worst_case_window_get_limit_with_reserve(
+		gin_ep.get_configured_rx_cq_size(), nranks,
+		gin_ep.get_rx_cq_reserve_margin(), ref_cnt);
+}
+
+void nccl_ofi_gin_resources::increment_ref_cnt()
+{
+	this->ref_cnt++;
+	refresh_shared_cq_window_limits();
+}
+
+void nccl_ofi_gin_resources::release()
+{
+	assert_always(this->ref_cnt > 0);
+	this->ref_cnt--;
+	if (this->ref_cnt == 0) {
+		delete this;
+		return;
+	}
+	refresh_shared_cq_window_limits();
+}
+
+void nccl_ofi_gin_resources::refresh_shared_cq_window_limits()
+{
+	/* NCCL setup path assigns one proxy thread per listen_seq % nthreads bucket,
+	 * so a given endpoint shared-CQ window bookkeeping is single-threaded during
+	 * steady-state use. Teardown keeps that invariant too: ncclGinHostFinalize()
+	 * stops and joins every proxy thread before closeColl() reaches release() here
+	 * (see nccl-src/src/gin/gin_host.cc). */
+	if (gin_ep.get_uses_posted_recv_flow()) {
+		return;
+	}
+	for (auto *comm : gin_comms) {
+		if (comm != nullptr) {
+			comm->update_shared_cq_window_limit(
+				get_shared_cq_window_limit(comm->get_nranks()));
+		}
+	}
+}
+
+void nccl_ofi_gin_resources::maybe_warn_cq_sizing_mismatch(uint32_t requested_nranks)
+{
+	/* The static CQ budget on gin_worst_case_window_limit() is still computed
+	 * once for the CQ owned by this cached endpoint, but writedata-routed
+	 * communicators now divide that allowance by ref_cnt whenever they derive
+	 * a per-comm sender window. This warning therefore only needs to describe
+	 * nranks mismatches across reused communicators, not a multi-comm gap. */
+	if (requested_nranks == gin_ep.get_cq_sizing_nranks()) {
+		return;
+	}
+
+	if (!cq_sizing_mismatch_warned.exchange(true, std::memory_order_relaxed)) {
+		NCCL_OFI_INFO(NCCL_NET,
+			      "GIN RX CQ already sized for nranks=%u (CQ entries=%zu); "
+			      "later connect() requested nranks=%u and reuses the "
+			      "existing CQ because live CQ resize is unsupported",
+			      gin_ep.get_cq_sizing_nranks(), gin_ep.get_configured_rx_cq_size(),
+			      requested_nranks);
+	}
 }
 
 void nccl_ofi_gin_resources::init_flush_buffers(uint16_t num_rails)

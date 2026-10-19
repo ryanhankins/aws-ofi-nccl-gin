@@ -569,11 +569,9 @@ public:
 	 * FI_WRITE for an endpoint that only writes, FI_WRITE | FI_READ for one
 	 * that also issues reads.
 	 */
-	void open(struct fid_domain *domain,
-		  struct fi_info *ref_info,
-		  struct fi_efa_ops_gda *gda_ops,
-		  uint64_t cntr_flags,
-		  uint32_t inline_write_size);
+	void open(struct fid_domain *domain, struct fi_info *ref_info,
+		  struct fi_efa_ops_gda *gda_ops, uint64_t cntr_flags,
+		  size_t cq_size, uint32_t inline_write_size);
 
 	/**
 	 * Populate the inner endpoint's GPU descriptors (QP/CQ attrs,
@@ -644,8 +642,8 @@ public:
 	 * read. Creating it anyway costs a scarce EFA hardware counter, which is
 	 * what limits how many contexts a rank can open. */
 	void open(struct fid_domain *domain, struct fi_info *ref_info,
-		  struct fi_efa_ops_gda *gda_ops, bool want_write_cntr,
-		  bool want_remote_write_cntr);
+		  struct fi_efa_ops_gda *gda_ops, size_t cq_size,
+		  bool want_write_cntr, bool want_remote_write_cntr);
 
 	/**
 	 * Populate the inner endpoint's GPU descriptors, build the
