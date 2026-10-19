@@ -74,8 +74,14 @@ nccl_ofi_rdma_gin_ep_t::nccl_ofi_rdma_gin_ep_t(nccl_net_ofi_domain_t &domain_arg
 	assert_always(this->num_rails > 0);
 	rails.reserve(this->num_rails);
 
-	// Create rails
-	for (uint16_t r = 0; r < this->num_rails; r++) {
+	/*
+	 * Create rails. Rail 0 reuses the fi_info fetched above (this is the
+	 * same fi_getinfo() result rail 0 would otherwise re-derive), so only
+	 * rails 1..N-1 need their own get_gin_info() call. This turns what
+	 * was an N+1 fi_getinfo() call sequence into N.
+	 */
+	rails.emplace_back(uint16_t{0}, domain, std::move(gin_info));
+	for (uint16_t r = 1; r < this->num_rails; r++) {
 		rails.emplace_back(r, domain);
 	}
 	this->scheduler = new nccl_net_ofi_threshold_scheduler(this->num_rails);
@@ -492,7 +498,8 @@ static inline struct fi_info *get_gin_info(struct fi_info *info)
 	return results.release();
 }
 
-nccl_ofi_gin_ep_rail_t::nccl_ofi_gin_ep_rail_t(uint16_t rail_id_, nccl_net_ofi_domain_t &domain)
+nccl_ofi_gin_ep_rail_t::nccl_ofi_gin_ep_rail_t(uint16_t rail_id_, nccl_net_ofi_domain_t &domain,
+					      ofi_info_ptr &&cached_gin_info)
     : rail_id(rail_id_)
 {
 	ofi_domain_ptr &ofi_domain = domain.get_ofi_domain(rail_id);
@@ -518,8 +525,17 @@ nccl_ofi_gin_ep_rail_t::nccl_ofi_gin_ep_rail_t(uint16_t rail_id_, nccl_net_ofi_d
 
 	av = std::move(av_result.resource);
 
-	struct fi_info *info = domain.get_device()->get_ofi_info(rail_id);
-	ofi_info_ptr gin_info(get_gin_info(info));
+	/* Reuse the caller-provided fi_info (already GIN-negotiated for this
+	 * rail's device) when available, avoiding a redundant fi_getinfo()
+	 * call; otherwise fetch it ourselves. Ownership is only taken here
+	 * (via std::move), after CQ/AV creation above have already succeeded,
+	 * so if either of those throws, the still-owning caller-side unique_ptr
+	 * cleans up the fi_info list during stack unwinding instead of leaking
+	 * it. */
+	ofi_info_ptr gin_info(
+		cached_gin_info ? std::move(cached_gin_info)
+				: ofi_info_ptr(get_gin_info(
+				domain.get_device()->get_ofi_info(rail_id))));
 
 	/* Create ep */
 	auto ep_result = nccl_ofi_ofiutils_ep_create(gin_info.get(), ofi_domain, av, this->rail_cq);
