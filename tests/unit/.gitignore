@@ -23,3 +23,4 @@ mpsc_ring
 gin_write_req
 gin_cq_math
 gin_close_progress
+gin_comm_id_lifecycle
