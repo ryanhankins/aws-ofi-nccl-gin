@@ -233,7 +233,19 @@ struct nccl_net_ofi_gin_signal_metadata_msg_t {
 static_assert(sizeof(nccl_net_ofi_gin_signal_metadata_msg_t) == 32,
 	     "nccl_net_ofi_gin_signal_metadata_msg_t must be exactly 32 bytes for inline send");
 
+/* Wide enough to grant the full sequence window (see static_assert below). */
 #define GIN_ACK_MSG_GRANTED_WINDOW_BITS 14
+/*
+ * Software budget for writedata operations outstanding at one CXI target.
+ * Each can hold a target event-queue entry until the receiver progresses.
+ * With OFI_NCCL_CQ_SIZE=4096, CXI's default 50% EQ-fill threshold is at least
+ * about 2048 entries; 384 keeps aggregate writes under 20% of that, leaving
+ * the rest for control traffic and other provider events. Unbounded 8-rank
+ * runs with target progress paused overran the threshold. This is planning
+ * headroom, not a provider-reported capacity.
+ */
+#define GIN_CXI_EQ_EVENT_BUDGET 384
+#define GIN_CXI_PAIR_DOORBELL_MIN (64 * 1024)
 #define GIN_ACK_GRANT_MAX ((1U << GIN_ACK_MSG_GRANTED_WINDOW_BITS) - 1)
 #define GIN_ACK_MSG_RESERVED_BITS (64 - GIN_MSG_TYPE_BITS - GIN_IMM_COMM_BITS - GIN_RX_CONSUMED_BITS - GIN_ACK_MSG_GRANTED_WINDOW_BITS)
 
@@ -285,6 +297,19 @@ static_assert(
    against the receiver-granted window so grant shrink can never leave the
    sender blocked below a stale fixed gate. */
 #define GIN_ACK_REQ_THRESHOLD ((GIN_IMM_SEQ_MASK + 1) / 2)
+
+static inline uint32_t gin_cxi_eq_get_window_limit(uint32_t nranks)
+{
+	const uint32_t peers = nranks > 1 ? nranks - 1 : 0;
+	if (peers == 0) {
+		return GIN_IMM_SEQ_MASK + 1;
+	}
+	/* Leave one event per peer as guard band after dividing the budget.
+	 * Keep one operation per peer for progress; above the budget's peer
+	 * count that floor is no longer a strict aggregate event bound. */
+	const uint32_t budget_per_peer = GIN_CXI_EQ_EVENT_BUDGET / peers;
+	return std::max<uint32_t>(1, budget_per_peer > 0 ? budget_per_peer - 1 : 0);
+}
 
 static_assert(GIN_TARGET_GRANTED_WINDOW <= GIN_ACK_GRANT_MAX,
 	      "GIN auto-sized target window must fit in the ACK grant field");
