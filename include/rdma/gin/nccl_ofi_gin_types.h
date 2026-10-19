@@ -158,8 +158,8 @@ struct nccl_net_ofi_gin_signal_metadata_msg_t {
 static_assert(sizeof(nccl_net_ofi_gin_signal_metadata_msg_t) == 32,
 	     "nccl_net_ofi_gin_signal_metadata_msg_t must be exactly 32 bytes for inline send");
 
-#define GIN_ACK_MSG_RESERVED_BITS (64 - GIN_MSG_TYPE_BITS - GIN_IMM_COMM_BITS \
-                                   - GIN_RX_CONSUMED_BITS)
+#define GIN_ACK_MSG_GRANTED_WINDOW_BITS 14
+#define GIN_ACK_MSG_RESERVED_BITS (64 - GIN_MSG_TYPE_BITS - GIN_IMM_COMM_BITS - GIN_RX_CONSUMED_BITS - GIN_ACK_MSG_GRANTED_WINDOW_BITS)
 
 /**
  * Standalone ACK message sent via fi_send from receiver to sender (8 bytes).
@@ -174,6 +174,8 @@ struct gin_ack_msg_t {
 	uint64_t ack_comm_id     : GIN_IMM_COMM_BITS;
 	/* Receiver's rx_consumed cursor (wraps at 2x seq window) */
 	uint64_t rx_consumed     : GIN_RX_CONSUMED_BITS;
+	/* Receiver-granted sender outstanding window */
+	uint64_t granted_window  : GIN_ACK_MSG_GRANTED_WINDOW_BITS;
 	/* Reserved for future use */
 	uint64_t reserved        : GIN_ACK_MSG_RESERVED_BITS;
 };
@@ -198,7 +200,7 @@ static_assert(
 	"msg_type must be at LSB of nccl_net_ofi_gin_msg_header_t");
 static_assert(
 	__builtin_bit_cast(uint64_t,
-		gin_ack_msg_t{GIN_MSG_TYPE_MAX, 0, 0, 0})
+		gin_ack_msg_t{GIN_MSG_TYPE_MAX, 0, 0, 0, 0})
 		== (uint64_t)GIN_MSG_TYPE_MAX,
 	"msg_type must be at LSB of gin_ack_msg_t");
 #endif
