@@ -5,11 +5,15 @@
 #include "config.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
 #include <thread>
+#include <vector>
 
 #include "rdma/gin/nccl_ofi_gin.h"
 #include "rdma/gin/nccl_ofi_gin_api.h"
+#include "rdma/gin/nccl_ofi_gin_close_progress.h"
 #include "rdma/gin/nccl_ofi_gin_types.h"
 #include "nccl_ofi.h"
 #include "nccl_ofi_api.h"
@@ -295,6 +299,87 @@ ncclResult_t nccl_ofi_gin_closeColl(void *collComm)
 	int ret = gin_comm->await_pending_requests();
 	if (OFI_UNLIKELY(ret != 0)) {
 		return nccl_net_ofi_retval_translate(ret);
+	}
+
+	if (endpoint_mr) {
+		/* NCCL stops the GIN proxy (progress) threads before closeColl, so a
+		   rank that owes no ACKs would tear down without ever processing the
+		   last inbound ops of a slower peer, whose ACK wait above then never
+		   completes (observed as an intermittent hang at comm destroy). Hold
+		   every rank here, still progressing, until all ranks have drained
+		   their own ACK requests; only then is it safe to remove the comm. */
+		std::atomic<bool> barrier_done{false};
+		std::mutex progress_state_mutex;
+		std::condition_variable progress_state_cv;
+		bool initial_progress_complete = false;
+		int progress_error = 0;
+		std::thread progress_thread([&]() {
+			while (!barrier_done.load(std::memory_order_acquire)) {
+				int progress_ret;
+				{
+					std::lock_guard<std::mutex> lock(gin_comm->get_ep_lock());
+					progress_ret = gin_comm->get_resources().progress();
+					if (progress_ret == 0) {
+						progress_ret = gin_comm->drain_gdrcopy_done_queue();
+					}
+				}
+				{
+					std::lock_guard<std::mutex> lock(progress_state_mutex);
+					if (progress_ret != 0) {
+						progress_error = progress_ret;
+					}
+					initial_progress_complete = true;
+				}
+				progress_state_cv.notify_one();
+				if (OFI_UNLIKELY(progress_ret != 0)) {
+					break;
+				}
+				std::this_thread::yield();
+			}
+		});
+		{
+			std::unique_lock<std::mutex> lock(progress_state_mutex);
+			progress_state_cv.wait(lock, [&]() { return initial_progress_complete; });
+		}
+
+		/* Stop and join the worker before checking its terminal result. No
+		   worker can publish an error between the check and all-gather. The
+		   collective drives GIN progress on this thread while waiting, so a
+		   peer can still receive ACKs. The ring all-gather has no distributed
+		   cancellation path; peers may remain blocked after a local error. */
+		std::vector<char> arrived(gin_comm->get_nranks(), 0);
+		arrived[gin_comm->get_rank()] = 1;
+		int close_progress_error = 0;
+		int barrier_progress_error = 0;
+		ret = nccl_ofi_gin_stop_progress_before_close_barrier(
+			barrier_done, progress_thread, progress_state_mutex, progress_error,
+			close_progress_error,
+			[&]() {
+				return gin_comm->get_ag_comm().all_gather(arrived.data(), 1, [&]() {
+					std::lock_guard<std::mutex> lock(gin_comm->get_ep_lock());
+					int progress_ret = gin_comm->get_resources().progress();
+					if (progress_ret == 0) {
+						progress_ret = gin_comm->drain_gdrcopy_done_queue();
+					}
+					if (barrier_progress_error == 0 && progress_ret != 0) {
+						barrier_progress_error = progress_ret;
+					}
+					return progress_ret;
+				});
+			});
+		if (OFI_UNLIKELY(close_progress_error != 0)) {
+			NCCL_OFI_WARN("GIN close barrier progress failed before all-gather: %d",
+				      close_progress_error);
+			return nccl_net_ofi_retval_translate(close_progress_error);
+		}
+		if (OFI_UNLIKELY(barrier_progress_error != 0)) {
+			NCCL_OFI_WARN("GIN close barrier progress failed during all-gather: %d",
+				      barrier_progress_error);
+			return nccl_net_ofi_retval_translate(barrier_progress_error);
+		}
+		if (OFI_UNLIKELY(ret != 0)) {
+			return nccl_net_ofi_retval_translate(ret);
+		}
 	}
 
 	/* Phase 1 — quiesce the shared gdrcopy worker for this comm. The worker

@@ -31,7 +31,8 @@ noinst_PROGRAMS = \
 	platform_manager \
 	spinlock \
 	spsc_ring \
-	mpsc_ring
+	mpsc_ring \
+	gin_close_progress
 
 if WANT_PLATFORM_AWS
 noinst_PROGRAMS += aws_platform_mapper
@@ -71,6 +72,7 @@ platform_manager_SOURCES = $(base_sources) platform_manager.cpp
 spinlock_SOURCES = $(base_sources) spinlock.cpp
 spsc_ring_SOURCES = $(base_sources) spsc_ring.cpp
 mpsc_ring_SOURCES = $(base_sources) mpsc_ring.cpp
+gin_close_progress_SOURCES = $(base_sources) gin_close_progress.cpp
 
 TESTS = $(noinst_PROGRAMS)
 endif

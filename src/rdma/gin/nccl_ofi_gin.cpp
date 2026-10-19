@@ -461,6 +461,18 @@ int nccl_ofi_rdma_gin_put_comm::deregMrSymLocked(nccl_ofi_rdma_gin_symm_mr_handl
 	}
 
 	if (mr_handle->type == NCCL_PTR_CUDA) {
+		/* The gdrcopy worker may still hold queued signal work that points
+		   into the segments released below (a peer's last signals can land
+		   after the window is torn down locally). Let it finish first; this
+		   is the same drain closeColl does before deleting the comm. New
+		   hand-offs cannot start meanwhile: they need ep_lock, which we hold. */
+		while (has_outstanding_gdrcopy()) {
+			if (OFI_UNLIKELY(drain_gdrcopy_done_queue() != 0)) {
+				break;
+			}
+			std::this_thread::yield();
+		}
+
 		/* Release the lazily-pinned segments under the worker's append
 		   lock. Best-effort: log and continue on error, never bail out. */
 		std::lock_guard<std::mutex> seg_lock(signal_segs_mtx);
@@ -518,6 +530,13 @@ int nccl_ofi_rdma_gin_put_comm::await_pending_requests()
 			}
 			if (any_pending) {
 				ret = get_resources().progress();
+				if (OFI_UNLIKELY(ret != 0)) {
+					return ret;
+				}
+				/* Reap gdrcopy signal completions too: retiring inbound ops
+				   (and hence sending the peer the ACKs it is waiting on)
+				   depends on it, and no proxy thread runs at this point. */
+				ret = drain_gdrcopy_done_queue();
 				if (OFI_UNLIKELY(ret != 0)) {
 					return ret;
 				}
@@ -1151,6 +1170,25 @@ int nccl_ofi_rdma_gin_put_comm::build_signal_work(
 
 	auto it = this->mr_handle_map.find(signal_base);
 	if (OFI_UNLIKELY(it == this->mr_handle_map.end())) {
+		if (endpoint_mr) {
+			/* A peer's final signals can arrive after this rank has
+			   deregistered the signal window (comm teardown is not
+			   ordered across ranks). Failing here would wedge CQ
+			   processing and with it the peer's ACK wait, so retire
+			   the op normally and sink the increment instead. */
+			static uint64_t late_signal_sink;
+			NCCL_OFI_INFO(NCCL_NET, "Dropping late signal for deregistered base %p",
+				      signal_base);
+			work.signal_base_address = metadata.signal_base_address;
+			work.signal_value = metadata.signal_value;
+			work.type = NCCL_PTR_HOST;
+			work.signal_never_reset = false;
+			work.gdr_handle = nullptr;
+			work.signal_offset = 0;
+			work.host_signal_va = reinterpret_cast<uintptr_t>(&late_signal_sink);
+			work.signal_shadow_slot = nullptr;
+			return 0;
+		}
 		NCCL_OFI_WARN("Signal base address %p not found in MR handle map", signal_base);
 		return -EINVAL;
 	}
