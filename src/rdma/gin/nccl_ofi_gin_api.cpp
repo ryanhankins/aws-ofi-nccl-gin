@@ -51,7 +51,7 @@ ncclResult_t nccl_ofi_gin_init(void **ctx, uint64_t commId, ncclDebugLogger_t lo
 		return ncclInternalError;
 	}
 
-	/* We make the global MR assumption in various places. */
+	/* GIN does not yet support FI_MR_ENDPOINT providers end to end. */
 	if (endpoint_mr) {
 		NCCL_OFI_WARN("GIN plugin does not support FI_MR_ENDPOINT");
 		return ncclInternalError;

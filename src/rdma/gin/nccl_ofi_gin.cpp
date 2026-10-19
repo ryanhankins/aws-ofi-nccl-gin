@@ -410,7 +410,9 @@ int nccl_ofi_rdma_gin_put_comm::regMrSymLocal(nccl_ofi_mr_ckey_ref ckey, void *d
 	if (virt_addr_mr) {
 		my_remote_mr.address_offset = my_remote_mr.address;
 	} else {
-		my_remote_mr.address_offset = 0;
+		/* The registration may begin before the user's buffer due to MR alignment. */
+		my_remote_mr.address_offset =
+			my_remote_mr.address - nccl_ofi_mr_ckey_baseaddr(ckey);
 	}
 	my_remote_mr.num_rails = gin_ep.get_num_rails();
 

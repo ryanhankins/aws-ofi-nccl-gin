@@ -159,11 +159,11 @@ struct gin_remote_mr {
 	uintptr_t address;
 
 	/* Offset for RMA operations. For virt_addr_mr providers, this is equal
-	   to address. For non-virt_addr_mr providers, this is zero.
+	   to address. For non-virt_addr_mr providers, this is the buffer's
+	   offset from the registered base.
 
-	   Note: we need both of these, because when address_offset is zero, the
-	   actual virtual address is still needed for MR lookup in the signal
-	   delivery path. */
+	   The actual virtual address is still needed for MR lookup in the
+	   signal delivery path. */
 	uintptr_t address_offset;
 
 	int num_rails;
