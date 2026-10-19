@@ -245,12 +245,6 @@ int nccl_ofi_rdma_gin_ep_t::reg_mr(nccl_ofi_mr_ckey_ref ckey, int type,
 {
 	int ret = 0;
 
-	/* We do not support endpoint_mr mode yet */
-	if (OFI_UNLIKELY(endpoint_mr)) {
-		NCCL_OFI_WARN("Endpoint MR mode is not supported yet.");
-		return -EINVAL;
-	}
-
 	*mhandle = NULL;
 
 	nccl_ofi_idpool_t *key_pool = this->domain.mr_rkey_pool;
@@ -286,6 +280,17 @@ int nccl_ofi_rdma_gin_ep_t::reg_mr(nccl_ofi_mr_ckey_ref ckey, int type,
 			return mr_result.error_code;
 		}
 		ret_handle->set_mr(rail_id, mr_result.resource);
+
+		if (endpoint_mr) {
+			auto *ofi_ep = get_rail(rail_id).ofi_ep.get();
+			ret = nccl_ofi_ofiutils_mr_bind_and_enable(ret_handle->get_mr(rail_id),
+								   ofi_ep,
+								   rail_id,
+								   "data");
+			if (ret != 0) {
+				return ret;
+			}
+		}
 	}
 
 	*mhandle = ret_handle.release();
@@ -339,7 +344,8 @@ static inline void get_gin_hints(struct fi_info &hints, struct fi_info *ref_info
 	hints.ep_attr->type = FI_EP_RDM;
 
 	hints.domain_attr->mr_mode =
-		FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
+		FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED |
+		FI_MR_PROV_KEY | FI_MR_ENDPOINT;
 	hints.domain_attr->mr_key_size = (size_t)ofi_nccl_mr_key_size();
 	hints.domain_attr->threading = FI_THREAD_COMPLETION;
 
@@ -381,13 +387,17 @@ static inline struct fi_info *get_gin_info(struct fi_info *info)
 		api_version = FI_VERSION(1, 18);
 	}
 
-	struct fi_info *results = nullptr;
-	int ret = fi_getinfo(api_version, nullptr, nullptr, 0ULL, gin_hints.get(), &results);
+	struct fi_info *raw_results = nullptr;
+	int ret = fi_getinfo(api_version, nullptr, nullptr, 0ULL, gin_hints.get(), &raw_results);
 	if (ret != 0) {
 		throw std::runtime_error(
 			"fi_getinfo for GIN failed: " +
 			std::string(fi_strerror(-ret)));
 	};
+
+	/* Wrap immediately so every throw path below frees the provider result
+	 * list via fi_freeinfo() instead of leaking it. */
+	ofi_info_ptr results(raw_results);
 
 	/* There should only be exactly one result, that supports everything we asked for */
 	if (results == nullptr) {
@@ -400,7 +410,7 @@ static inline struct fi_info *get_gin_info(struct fi_info *info)
 		throw std::runtime_error("Provider does not support cq_data_size of 4");
 	}
 
-	return results;
+	return results.release();
 }
 
 nccl_ofi_gin_ep_rail_t::nccl_ofi_gin_ep_rail_t(uint16_t rail_id_, nccl_net_ofi_domain_t &domain)
@@ -596,13 +606,26 @@ nccl_ofi_gin_resources::~nccl_ofi_gin_resources()
 		flush_buff = nullptr;
 	}
 
-	/* For non-endpoint-MR providers, we first close the OFI endpoint, then
-	   let resources clean up in reverse-order. */
-	gin_ep.close_ofi_eps();
-
-	/* For endpoint-MR providers (which GIN plugin does not yet support),
-	   first we need to cancel the receives, then deregister memory, and
-	   then close the endpoints. */
+	/*
+	 * For non-FI_MR_ENDPOINT providers, we close the OFI endpoint here,
+	 * then let the remaining members clean up in reverse declaration
+	 * order.
+	 *
+	 * For FI_MR_ENDPOINT providers, we skip closing the endpoint here so
+	 * that ack_send_fl and rx_buff_fl (whose MRs are bound to gin_ep) can
+	 * deregister those MRs before gin_ep tears down the bound endpoints
+	 * below, in reverse declaration order. This only satisfies the
+	 * constraint that bound endpoints must outlive their registered MRs;
+	 * it does not cancel the receive requests still posted against
+	 * rx_buff_fl's buffers (recv_reqs), so deregistration currently races
+	 * with those outstanding fi_recv()s. This mirrors the same known gap
+	 * documented in cm::endpoint::~endpoint(), and appears to work with
+	 * CXI, so is a reasonable first step; properly supporting
+	 * FI_MR_ENDPOINT will also require cancelling recv_reqs here first.
+	 */
+	if (!endpoint_mr) {
+		gin_ep.close_ofi_eps();
+	}
 }
 
 int nccl_ofi_gin_resources::progress()
