@@ -461,18 +461,16 @@ void gdaki_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda_op
 	targets.populate(endpoint, all_addrs, ep_addr_len, total_slots, nranks, gda_ops);
 }
 
-void gdaki_data_endpoint::open(struct fid_domain *domain,
-			       struct fi_info *ref_info,
-			       struct fi_efa_ops_gda *gda_ops,
-			       uint64_t cntr_flags,
-			       uint32_t inline_write_size)
+void gdaki_data_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
+			       struct fi_efa_ops_gda *gda_ops, uint64_t cntr_flags,
+			       size_t cq_size, uint32_t inline_write_size)
 {
 	/* Create the counter first; it will be bound to the inner endpoint
 	 * between open() and enable(). */
 	local_cntr.create(gda_ops, domain);
 
 	/* Open the inner endpoint without enable. */
-	base.endpoint.open(domain, ref_info, ofi_nccl_cq_size(), inline_write_size);
+	base.endpoint.open(domain, ref_info, cq_size, inline_write_size);
 
 	base.endpoint.bind(&local_cntr.get()->fid, cntr_flags);
 
@@ -489,8 +487,8 @@ void gdaki_data_endpoint::populate(int backend_version, struct fi_efa_ops_gda *g
 }
 
 void gdaki_sc_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
-			     struct fi_efa_ops_gda *gda_ops, bool want_write_cntr,
-			     bool want_remote_write_cntr)
+			     struct fi_efa_ops_gda *gda_ops, size_t cq_size,
+			     bool want_write_cntr, bool want_remote_write_cntr)
 {
 	/* Create hardware counters first; they will be bound to the inner
 	 * endpoint between open() and enable(). This endpoint creates the counter
@@ -506,7 +504,7 @@ void gdaki_sc_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info
 
 	/* Open the inner endpoint without enable. Use the same CQ sizing as
 	 * the data endpoint so callers get consistent capacity per env config. */
-	base.endpoint.open(domain, ref_info, ofi_nccl_cq_size(), /* inline_write_size */ 0);
+	base.endpoint.open(domain, ref_info, cq_size, /* inline_write_size */ 0);
 
 	/* Bind counters before enabling. */
 	if (want_write_cntr) {

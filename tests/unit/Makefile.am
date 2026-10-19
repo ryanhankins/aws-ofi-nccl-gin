@@ -33,7 +33,8 @@ noinst_PROGRAMS = \
 	spsc_ring \
 	mpsc_ring \
 	gin_close_progress \
-	gin_write_req
+	gin_write_req \
+	gin_cq_math
 
 if WANT_PLATFORM_AWS
 noinst_PROGRAMS += aws_platform_mapper
@@ -74,6 +75,7 @@ spinlock_SOURCES = $(base_sources) spinlock.cpp
 spsc_ring_SOURCES = $(base_sources) spsc_ring.cpp
 mpsc_ring_SOURCES = $(base_sources) mpsc_ring.cpp
 gin_write_req_SOURCES = $(base_sources) gin_write_req.cpp
+gin_cq_math_SOURCES = $(base_sources) gin_cq_math.cpp
 gin_close_progress_SOURCES = $(base_sources) gin_close_progress.cpp
 
 TESTS = $(noinst_PROGRAMS)
