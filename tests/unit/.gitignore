@@ -20,4 +20,5 @@ spinlock
 spsc_ring
 ctrl_msg
 mpsc_ring
+gin_write_req
 gin_close_progress
