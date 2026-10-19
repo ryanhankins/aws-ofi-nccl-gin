@@ -4,6 +4,7 @@
 
 #include "config.h"
 
+#include <algorithm>
 #include <mutex>
 #include <thread>
 
@@ -552,10 +553,43 @@ int nccl_ofi_rdma_gin_put_comm::await_pending_requests()
 	return ret;
 }
 
+/* Per-peer cap on un-ACKed ops. On endpoint-MR providers (CXI) every
+ * remote write with immediate data posts one event to a fixed-size target
+ * control event queue (64 KiB by default, ~1024 events) that is only drained
+ * when the target progresses. If it overflows the NIC fails the writes with
+ * ENTRY_NOT_FOUND. Because the cursors count ops until the receiver has
+ * consumed them (ACKs carry rx_consumed), bounding outstanding ops bounds the
+ * queue occupancy: keep the sum over peers under GIN_EQ_EVENT_BUDGET.
+ * Other providers keep the full sequence window. */
+#define GIN_EQ_EVENT_BUDGET 384
+#define GIN_MIN_TX_WINDOW 32
+
+static inline uint32_t gin_tx_window(int nranks)
+{
+	uint32_t full = GIN_IMM_SEQ_MASK + 1;
+	if (!endpoint_mr) {
+		return full;
+	}
+	uint32_t w = GIN_EQ_EVENT_BUDGET / (uint32_t)std::max(1, nranks - 1);
+	return std::min(full, std::max<uint32_t>(GIN_MIN_TX_WINDOW, w));
+}
+
+/* ACK request policy for a given window: ask once half full, then every
+ * interval ops. The interval must fit well inside the half-window. */
+static inline uint32_t gin_ack_threshold(uint32_t window)
+{
+	return window / 2;
+}
+
+static inline uint32_t gin_ack_interval(uint32_t window)
+{
+	return std::min<uint32_t>(GIN_ACK_INTERVAL, std::max<uint32_t>(1, window / 8));
+}
+
 int nccl_ofi_rdma_gin_put_comm::await_tx_window(nccl_ofi_gin_peer_rank_info &rank_comm)
 {
 	uint32_t outstanding = gin_cursor_delta(rank_comm.tx_head, rank_comm.tx_tail);
-	while (OFI_UNLIKELY(outstanding >= (uint32_t)(GIN_IMM_SEQ_MASK + 1))) {
+	while (OFI_UNLIKELY(outstanding >= gin_tx_window(nranks))) {
 		{
 			std::lock_guard<std::mutex> lock(get_ep_lock());
 			int ret = get_resources().progress();
@@ -649,8 +683,9 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 	bool is_ack_requested = false;
 	const uint32_t outstanding = gin_cursor_delta(rank_comm.tx_head, rank_comm.tx_tail);
 
-	if (OFI_UNLIKELY(outstanding >= GIN_ACK_REQ_THRESHOLD)) {
-		if (OFI_UNLIKELY(rank_comm.consecutive_puts_without_ack++ >= GIN_ACK_INTERVAL)) {
+	const uint32_t tx_window = gin_tx_window(nranks);
+	if (OFI_UNLIKELY(outstanding >= gin_ack_threshold(tx_window))) {
+		if (OFI_UNLIKELY(rank_comm.consecutive_puts_without_ack++ >= gin_ack_interval(tx_window))) {
 			is_ack_requested = true;
 			rank_comm.consecutive_puts_without_ack = 0;
 		}
