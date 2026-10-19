@@ -32,6 +32,7 @@ noinst_PROGRAMS = \
 	spinlock \
 	spsc_ring \
 	mpsc_ring \
+	gin_close_progress \
 	gin_write_req
 
 if WANT_PLATFORM_AWS
@@ -73,6 +74,7 @@ spinlock_SOURCES = $(base_sources) spinlock.cpp
 spsc_ring_SOURCES = $(base_sources) spsc_ring.cpp
 mpsc_ring_SOURCES = $(base_sources) mpsc_ring.cpp
 gin_write_req_SOURCES = $(base_sources) gin_write_req.cpp
+gin_close_progress_SOURCES = $(base_sources) gin_close_progress.cpp
 
 TESTS = $(noinst_PROGRAMS)
 endif
