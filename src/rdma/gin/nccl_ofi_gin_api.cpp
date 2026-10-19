@@ -51,12 +51,6 @@ ncclResult_t nccl_ofi_gin_init(void **ctx, uint64_t commId, ncclDebugLogger_t lo
 		return ncclInternalError;
 	}
 
-	/* We make the global MR assumption in various places. */
-	if (endpoint_mr) {
-		NCCL_OFI_WARN("GIN plugin does not support FI_MR_ENDPOINT");
-		return ncclInternalError;
-	}
-
 	/* GDR copy context is now a singleton, lazily initialized on first use.
 	 * GIN requires GDRCopy 2.5+ for forced PCIe copy support. */
 	try {
