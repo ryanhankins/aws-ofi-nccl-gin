@@ -805,7 +805,11 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 				xfers[0].rail_id = static_cast<uint16_t>(pinned_rail_id);
 			}
 		}
-		defer = (num_xfers == 1) && aggregate &&
+		/* An op that requests an ACK must ring its doorbell. If it were
+		   deferred and the TX window then filled, the receiver would never
+		   see the request, never ACK, and await_tx_window() would spin
+		   forever (hit at 32 ranks, where the window is small). */
+		defer = !is_ack_requested && (num_xfers == 1) && aggregate &&
 			(pinned_rail_run + 1 < GIN_REQS_PER_DOORBELL);
 
 		nseg += num_xfers;
@@ -876,7 +880,7 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 		rail_id = (pinned_rail_id >= 0)
 			? static_cast<uint16_t>(pinned_rail_id)
 			: get_resources().get_next_rail();
-		defer = aggregate &&
+		defer = !is_ack_requested && aggregate &&
 			(pinned_rail_run + 1 < GIN_REQS_PER_DOORBELL);
 	}
 
