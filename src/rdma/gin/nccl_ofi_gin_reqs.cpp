@@ -263,11 +263,22 @@ int nccl_net_ofi_gin_write_req_t::post()
 
 	ssize_t rc = fi_writemsg(ep, &msg, flags);
 
-	/* Drop FI_MORE for retry — must not remain pending in the queue */
-	flags &= ~FI_MORE;
-
 	if (OFI_UNLIKELY(rc != 0 && rc != -FI_EAGAIN)) {
 		NCCL_OFI_WARN("Failed call to fi_writemsg; RC: %zd", rc);
+	}
+
+	return rc;
+}
+
+int nccl_ofi_gin_writedata_req::post()
+{
+	/* CXI requires fi_writedata (FI_CXI_ENABLE_WRITEDATA=1), rather than
+	 * FI_REMOTE_CQ_DATA in fi_writemsg flags. Leave endpoint defaults intact. */
+	ssize_t rc = fi_writedata(ep, src, size, desc, imm_data, remote_addr, dest, key,
+				  &ctx.ofi_ctx);
+
+	if (OFI_UNLIKELY(rc != 0 && rc != -FI_EAGAIN)) {
+		NCCL_OFI_WARN("Failed call to fi_writedata; RC: %zd", rc);
 	}
 
 	return rc;
@@ -303,10 +314,7 @@ int nccl_net_ofi_gin_metadata_send_req_t::post()
 	msg.addr = remote_addr;
 	msg.context = &ctx.ofi_ctx;
 
-	ssize_t rc = fi_sendmsg(ep, &msg, flags);
-
-	/* Drop FI_MORE for retry — must not remain pending in the queue */
-	flags &= ~FI_MORE;
+	ssize_t rc = fi_sendmsg(ep, &msg, 0);
 
 	if (rc != 0 && rc != -FI_EAGAIN) {
 		NCCL_OFI_WARN("fi_sendmsg failed with RC %zd", rc);

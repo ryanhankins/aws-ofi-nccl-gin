@@ -372,13 +372,23 @@ private:
  */
 class nccl_net_ofi_gin_write_req_t : public nccl_net_ofi_gin_op_req_t {
 public:
-	nccl_net_ofi_gin_write_req_t(struct fid_ep *ep_arg, void *src_arg, size_t size_arg,
-				     void *desc_arg, uint64_t imm_data_arg,
-				     fi_addr_t remote_addr_arg, uint64_t dest_arg, uint64_t key_arg,
-				     void* comm_arg, uint64_t msg_flags = 0)
-	    : ep(ep_arg), src(src_arg), size(size_arg), desc(desc_arg), imm_data(imm_data_arg),
-	      remote_addr(remote_addr_arg), dest(dest_arg), key(key_arg), flags(msg_flags),
-	      comm(comm_arg)
+	struct args {
+		struct fid_ep *ep;
+		void *src;
+		size_t size;
+		void *desc;
+		uint64_t imm_data;
+		fi_addr_t remote_addr;
+		uint64_t dest;
+		uint64_t key;
+		void *comm;
+		uint64_t flags;
+	};
+
+	explicit nccl_net_ofi_gin_write_req_t(const args &a)
+	    : ep(a.ep), src(a.src), size(a.size), desc(a.desc), imm_data(a.imm_data),
+	      remote_addr(a.remote_addr), dest(a.dest), key(a.key), flags(a.flags),
+	      comm(a.comm)
 	{
 	}
 	int post() override;
@@ -386,7 +396,7 @@ public:
 	int handle_cq_entry(struct fi_cq_entry *cq_entry_base, fi_addr_t src_addr,
 			    uint16_t rail_id) override;
 
-private:
+protected:
 	struct fid_ep *ep;
 	void *src;
 	size_t size;
@@ -395,9 +405,7 @@ private:
 	fi_addr_t remote_addr;
 	uint64_t dest;
 	uint64_t key;
-	/* Flags for fi_writemsg. On retry FI_MORE is dropped as the
-	   request must be handled immediately and should not remain
-	   pending in the queue. */
+	/* Flags for fi_writemsg. */
 	uint64_t flags;
 public:
 	/* Placed after private fields for cache locality with post() hot path above.
@@ -408,6 +416,13 @@ public:
 	   (e.g. recv_req_t), so we keep it here. */
 	void *comm;
 	bool *pending_flag;
+};
+
+class nccl_ofi_gin_writedata_req final : public nccl_net_ofi_gin_write_req_t {
+public:
+	using nccl_net_ofi_gin_write_req_t::nccl_net_ofi_gin_write_req_t;
+
+	int post() override;
 };
 
 /**
@@ -455,9 +470,9 @@ public:
 					     nccl_ofi_freelist::fl_entry *metadata_elem_arg,
 					     fi_addr_t remote_addr_arg,
 					     nccl_ofi_freelist *metadata_fl_arg,
-					     void *comm_arg, uint64_t msg_flags = 0)
+					     void *comm_arg)
 	    : ep(ep_arg), rail_id(rail_id_arg), metadata_elem(metadata_elem_arg),
-	      remote_addr(remote_addr_arg), metadata_fl(metadata_fl_arg), flags(msg_flags),
+	      remote_addr(remote_addr_arg), metadata_fl(metadata_fl_arg),
 	      comm(comm_arg)
 	{
 	}
@@ -474,9 +489,6 @@ private:
 	nccl_ofi_freelist::fl_entry *metadata_elem;
 	fi_addr_t remote_addr;
 	nccl_ofi_freelist *metadata_fl;
-	/* Flags for fi_sendmsg. On retry FI_MORE is dropped as the request
-	   must be handled immediately and should not remain pending. */
-	uint64_t flags;
 
 public:
 	/* Placed after private fields for cache locality with post() hot path above.
@@ -500,6 +512,7 @@ private:
 	nccl_ofi_rdma_gin_iputsignal_req iputsignal_req;
 	nccl_net_ofi_gin_iputsignal_recv_req iputsignal_recv_req;
 	nccl_net_ofi_gin_write_req_t write_req;
+	nccl_ofi_gin_writedata_req writedata_req;
 	nccl_net_ofi_gin_read_req_t read_req;
 	nccl_net_ofi_gin_metadata_send_req_t metadata_send_req;
 	nccl_ofi_gin_iget_req iget_req;

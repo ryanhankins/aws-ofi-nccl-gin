@@ -131,6 +131,11 @@ public:
 		resources_owner = resources_arg;
 	}
 
+	/* Select the pooled request type once; post() and retries use its vtable. */
+	using write_req_factory = nccl_net_ofi_gin_write_req_t *(*)(
+		nccl_ofi_gin_resources &, const nccl_net_ofi_gin_write_req_t::args &);
+	const write_req_factory make_write_req;
+
 	/**
 	 * Close Libfabric endpoint object. For non-endpoint-MR providers, this
 	 * should be done before memory can be deregistered.

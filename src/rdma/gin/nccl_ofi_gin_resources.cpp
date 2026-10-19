@@ -51,7 +51,17 @@ nccl_ofi_gin_resources_registry &gin_resources_registry()
 }
 static inline struct fi_info *get_gin_info(struct fi_info *info);
 
-nccl_ofi_rdma_gin_ep_t::nccl_ofi_rdma_gin_ep_t(nccl_net_ofi_domain_t &domain_arg) : domain(domain_arg)
+template <typename T>
+static nccl_net_ofi_gin_write_req_t *allocate_write_req(
+	nccl_ofi_gin_resources &resources, const nccl_net_ofi_gin_write_req_t::args &args)
+{
+	return resources.get_req_from_pool<T>(args);
+}
+
+nccl_ofi_rdma_gin_ep_t::nccl_ofi_rdma_gin_ep_t(nccl_net_ofi_domain_t &domain_arg)
+	: make_write_req(endpoint_mr ? allocate_write_req<nccl_ofi_gin_writedata_req>
+				    : allocate_write_req<nccl_net_ofi_gin_write_req_t>),
+	  domain(domain_arg)
 {
 	/*
 	 * Determine once, at construction, whether this provider negotiated
