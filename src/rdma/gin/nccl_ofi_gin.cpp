@@ -1858,6 +1858,19 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
 	return ret;
 }
 
+int nccl_ofi_rdma_gin_ep_t::handle_remote_write_completion(struct fi_cq_data_entry *cq_entry,
+							   fi_addr_t src_addr, uint16_t rail_id)
+{
+	if (OFI_UNLIKELY(resources_owner == nullptr)) {
+		NCCL_OFI_WARN("GIN remote-write completion arrived before resources owner init");
+		return -EINVAL;
+	}
+
+	uint16_t comm_id = GIN_IMM_GET_COMM_ID(cq_entry->data);
+	auto &gin_comm = resources_owner->get_comm(comm_id);
+	return gin_comm.handle_signal_write_completion(cq_entry, src_addr, rail_id);
+}
+
 int nccl_ofi_rdma_gin_put_comm::handle_ack_completion(const gin_ack_msg_t *ack_msg,
 						      fi_addr_t src_addr, uint16_t rail_id)
 {

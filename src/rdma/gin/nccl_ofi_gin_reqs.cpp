@@ -92,7 +92,13 @@ int nccl_net_ofi_gin_recv_req_t::handle_cq_entry(struct fi_cq_entry *cq_entry_ba
 	int ret = 0;
 
 	if (cq_entry->flags & FI_REMOTE_WRITE) {
-		/* RDMA write-immediate completion */
+		/* RDMA write-immediate completion. On providers that negotiate
+		 * FI_RX_CQ_DATA (e.g. EFA), unsolicited writedata completions are
+		 * only ever delivered against a posted fi_recv(), so this request's
+		 * op_context is valid here. Providers that don't require the mode
+		 * bit route writedata completions before op_context dispatch (see
+		 * nccl_ofi_rdma_gin_ep_t::gin_process_completions_writedata_routed())
+		 * and never reach this path. */
 		uint16_t comm_id = GIN_IMM_GET_COMM_ID(cq_entry->data);
 		auto &gin_comm = resources.get_comm(comm_id);
 

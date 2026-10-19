@@ -138,21 +138,63 @@ private:
 
 	/* Cached from param at construction; avoids mutex in CQ loop */
 	size_t cq_process_max_iter;
+
+	using process_completions_fn = int (nccl_ofi_rdma_gin_ep_t::*)(
+		struct fi_cq_data_entry *cq_entry, fi_addr_t *src_addrs, uint64_t num_cqes,
+		uint16_t rail_id);
+
+	/*
+	 * FI_REMOTE_WRITE completion handling diverges by provider:
+	 *  - Providers that do not request FI_RX_CQ_DATA (e.g. CXI) report
+	 *    target-side fi_writedata completions against the bound MR, not a
+	 *    posted fi_recv() context, so they must be classified by
+	 *    completion flags/immediate data and routed before op_context is
+	 *    ever touched.
+	 *  - Providers that request FI_RX_CQ_DATA (e.g. EFA) always deliver
+	 *    writedata completions against a posted-recv op_context.
+	 * process_completions_impl is selected once at construction from the
+	 * negotiated mode bit, so the CQ loop never has to branch on
+	 * cq_entry->flags per completion. CQ error entries are handled in a
+	 * single common path (see gin_process_cq_rail()) since the volume of
+	 * error completions doesn't warrant the same per-completion dispatch
+	 * cost avoidance.
+	 */
+	process_completions_fn process_completions_impl;
+
 	/**
-	 * Handler for list of CQ entries
+	 * Handler for list of CQ entries. Dispatches to the provider-specific
+	 * implementation selected at construction time.
 	 */
 	int gin_process_completions(struct fi_cq_data_entry *cq_entry, fi_addr_t *src_addrs,
-				    uint64_t num_cqes, uint16_t rail_id);
+				    uint64_t num_cqes, uint16_t rail_id)
+	{
+		return (this->*process_completions_impl)(cq_entry, src_addrs, num_cqes, rail_id);
+	}
 
+	/* CXI-like: route FI_REMOTE_WRITE completions directly by flags +
+	 * immediate data before touching op_context. */
+	int gin_process_completions_writedata_routed(struct fi_cq_data_entry *cq_entry,
+						     fi_addr_t *src_addrs, uint64_t num_cqes,
+						     uint16_t rail_id);
+	/* EFA-like: writedata completions always carry a valid posted-recv
+	 * op_context, so every completion dispatches the same way. */
+	int gin_process_completions_posted_recv(struct fi_cq_data_entry *cq_entry,
+						fi_addr_t *src_addrs, uint64_t num_cqes,
+						uint16_t rail_id);
+
+	/* Shared op_context dispatch used by both completion implementations
+	 * above for every completion that isn't routed by MR/immediate data. */
 	int dispatch_via_op_context(struct fi_cq_data_entry *cq_entry, fi_addr_t src_addr,
 				    uint16_t rail_id);
+
+	int handle_remote_write_completion(struct fi_cq_data_entry *cq_entry, fi_addr_t src_addr,
+					   uint16_t rail_id);
 
 	/**
 	 * CQ error entry handler
 	 */
 	int gin_process_error_entry(struct fi_cq_err_entry *err_entry, struct fid_cq *cq,
 				    uint16_t rail_id);
-
 	/**
 	 * Process all completions for the given rail
 	 */

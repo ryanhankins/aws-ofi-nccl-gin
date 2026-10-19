@@ -9,6 +9,7 @@
 #include "rdma/gin/nccl_ofi_gin_gdaki.h"
 
 #include "nccl_ofi_assert.h"
+#include <cinttypes>
 #include <cstdlib>
 #if HAVE_CUDA
 #include "nccl_ofi_cuda.h"
@@ -48,11 +49,29 @@ nccl_ofi_gin_resources_registry &gin_resources_registry()
 	static nccl_ofi_gin_resources_registry registry;
 	return registry;
 }
+static inline struct fi_info *get_gin_info(struct fi_info *info);
 
 nccl_ofi_rdma_gin_ep_t::nccl_ofi_rdma_gin_ep_t(nccl_net_ofi_domain_t &domain_arg) : domain(domain_arg)
 {
+	/*
+	 * Determine once, at construction, whether this provider negotiated
+	 * FI_RX_CQ_DATA (e.g. EFA) or not (e.g. CXI), and select the matching
+	 * CQ completion/error implementations. See the comment on
+	 * process_completions_impl in nccl_ofi_gin_resources.h for why this
+	 * differs by provider.
+	 */
+	ofi_info_ptr gin_info(get_gin_info(domain.get_device()->get_ofi_info(0)));
+	if (gin_info->mode & FI_RX_CQ_DATA) {
+		process_completions_impl =
+			&nccl_ofi_rdma_gin_ep_t::gin_process_completions_posted_recv;
+	} else {
+		process_completions_impl =
+			&nccl_ofi_rdma_gin_ep_t::gin_process_completions_writedata_routed;
+	}
+
 	this->num_rails = domain.get_ofi_num_rails();
 	this->cq_process_max_iter = ofi_nccl_gin_cq_process_max_iter();
+	assert_always(this->num_rails > 0);
 	rails.reserve(this->num_rails);
 
 	// Create rails
@@ -94,13 +113,46 @@ int nccl_ofi_rdma_gin_ep_t::dispatch_via_op_context(struct fi_cq_data_entry *cq_
 	return 0;
 }
 
-int nccl_ofi_rdma_gin_ep_t::gin_process_completions(struct fi_cq_data_entry *cq_entry,
-					       fi_addr_t *src_addrs, uint64_t num_cqes,
-					       uint16_t rail_id)
+int nccl_ofi_rdma_gin_ep_t::gin_process_completions_writedata_routed(
+	struct fi_cq_data_entry *cq_entry, fi_addr_t *src_addrs,
+	uint64_t num_cqes, uint16_t rail_id)
 {
 	int ret = 0;
 
 	for (uint64_t comp_idx = 0; comp_idx < num_cqes; comp_idx++) {
+		if (cq_entry[comp_idx].flags & FI_REMOTE_WRITE) {
+			/* Target-side writedata completions are keyed by the bound MR,
+			 * not by a posted fi_recv() context, so route them here by
+			 * completion flags + immediate data before touching op_context. */
+			ret = handle_remote_write_completion(&cq_entry[comp_idx],
+							     src_addrs[comp_idx], rail_id);
+			if (ret != 0) {
+				NCCL_OFI_WARN("GIN remote-write completion handling failed: %d",
+					      ret);
+				return ret;
+			}
+			continue;
+		}
+
+		ret = dispatch_via_op_context(&cq_entry[comp_idx], src_addrs[comp_idx], rail_id);
+		if (ret != 0) {
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+int nccl_ofi_rdma_gin_ep_t::gin_process_completions_posted_recv(
+	struct fi_cq_data_entry *cq_entry, fi_addr_t *src_addrs,
+	uint64_t num_cqes, uint16_t rail_id)
+{
+	int ret = 0;
+
+	for (uint64_t comp_idx = 0; comp_idx < num_cqes; comp_idx++) {
+		/* FI_RX_CQ_DATA guarantees writedata completions are always
+		 * delivered against a posted fi_recv(); handle_cq_entry() on that
+		 * request classifies FI_REMOTE_WRITE itself. */
 		ret = dispatch_via_op_context(&cq_entry[comp_idx], src_addrs[comp_idx], rail_id);
 		if (ret != 0) {
 			return ret;
@@ -119,9 +171,8 @@ int nccl_ofi_rdma_gin_ep_t::gin_process_error_entry(struct fi_cq_err_entry *err_
 		return -EINVAL;
 	}
 
-	nccl_net_ofi_gin_context *ctx =
-		cpp_container_of(static_cast<struct fi_context2 *>(op_ctx),
-				 &nccl_net_ofi_gin_context::ofi_ctx);
+	nccl_net_ofi_gin_context *ctx = cpp_container_of(static_cast<struct fi_context2 *>(op_ctx),
+							 &nccl_net_ofi_gin_context::ofi_ctx);
 
 	return ctx->handle_error_entry(cq, err_entry,
 					 rail_id);
@@ -170,6 +221,24 @@ int nccl_ofi_rdma_gin_ep_t::gin_process_cq_rail(uint16_t rail_id)
 				goto exit;
 			}
 
+			if (OFI_UNLIKELY((err_entry.flags & FI_REMOTE_WRITE) &&
+					err_entry.op_context == nullptr)) {
+				/* Target-side writedata errors are keyed by the bound MR,
+				 * not by a posted fi_recv() context (providers without
+				 * FI_RX_CQ_DATA); providers with FI_RX_CQ_DATA always
+				 * deliver a valid op_context, so this never fires there. */
+				NCCL_OFI_WARN("GIN remote-write CQ error on rail %hu. data=%" PRIu64
+					      " src_addr=%" PRIu64 " err=%d prov_errno=%d (%s)",
+					      rail_id, err_entry.data, err_entry.src_addr,
+					      err_entry.err, err_entry.prov_errno,
+					      fi_cq_strerror(rail_cq, err_entry.prov_errno,
+							     err_entry.err_data, NULL, 0));
+				ret = -(err_entry.err);
+				goto exit;
+			}
+
+			/* Every other completion (sends, acks, metadata, flush reads, ...)
+			 * always carries a valid op_context, independent of FI_RX_CQ_DATA. */
 			ret = gin_process_error_entry(&err_entry, rail_cq, rail_id);
 			if (ret != 0) {
 				goto exit;
