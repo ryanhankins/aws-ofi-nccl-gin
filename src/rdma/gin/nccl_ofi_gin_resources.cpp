@@ -506,6 +506,14 @@ nccl_ofi_gin_resources::nccl_ofi_gin_resources(const std::shared_ptr<nccl_net_of
       comm_id_pool(NCCL_GIN_MAX_COMMS)
 {
 	auto num_rails = gin_ep.get_num_rails();
+	/* Must be set before any CQ processing begins. gin_ep was just
+	 * constructed via the member-initializer list above (creating the CQ
+	 * and endpoints), but nothing can call gin_ep.process_cq() /
+	 * this->progress() until this constructor returns and the caller
+	 * obtains a reference to this resources object, so there is no window
+	 * in which handle_remote_write_completion() can observe
+	 * resources_owner still nullptr. */
+	gin_ep.set_resources_owner(this);
 
 	/* Create freelist for RX buffers */
 	constexpr size_t num_buffers = 2048; /* TODO param*/

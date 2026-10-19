@@ -113,6 +113,11 @@ public:
 	 */
 	int process_cq();
 
+	void set_resources_owner(nccl_ofi_gin_resources *resources_arg)
+	{
+		resources_owner = resources_arg;
+	}
+
 	/**
 	 * Close Libfabric endpoint object. For non-endpoint-MR providers, this
 	 * should be done before memory can be deregistered.
@@ -128,6 +133,8 @@ private:
 	std::vector<nccl_ofi_gin_ep_rail_t> rails;
 
 	nccl_net_ofi_scheduler *scheduler;
+
+	nccl_ofi_gin_resources *resources_owner = nullptr;
 
 	/* Cached from param at construction; avoids mutex in CQ loop */
 	size_t cq_process_max_iter;
