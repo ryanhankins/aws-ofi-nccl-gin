@@ -30,7 +30,20 @@ static inline void freelist_deleter(nccl_ofi_freelist *fl)
  * A rail of the GIN endpoint
  */
 struct nccl_ofi_gin_ep_rail_t {
-	nccl_ofi_gin_ep_rail_t(uint16_t rail_id_, nccl_net_ofi_domain_t &domain);
+	/**
+	 * @param cached_gin_info: Optional pre-fetched GIN-negotiated fi_info,
+	 *   as returned by get_gin_info(). Pass non-null only when the caller
+	 *   already called get_gin_info() for this exact rail's device (e.g.
+	 *   rail 0, whose result the EP constructor also needs to inspect the
+	 *   negotiated mode bit) so we avoid a second redundant fi_getinfo()
+	 *   call. If null, this rail calls get_gin_info() itself. Passed by
+	 *   rvalue-ref unique_ptr (rather than a raw owning pointer) so
+	 *   ownership transfer is exception-safe: this constructor can throw
+	 *   before it gets a chance to wrap the pointer (e.g. CQ/AV creation
+	 *   failure) without leaking the provider fi_info list.
+	 */
+	nccl_ofi_gin_ep_rail_t(uint16_t rail_id_, nccl_net_ofi_domain_t &domain,
+			      ofi_info_ptr &&cached_gin_info = ofi_info_ptr(nullptr));
 
 	~nccl_ofi_gin_ep_rail_t() = default;
 	nccl_ofi_gin_ep_rail_t(nccl_ofi_gin_ep_rail_t &&other) = default;
