@@ -173,7 +173,6 @@ static_assert((1ULL << GIN_RX_CONSUMED_BITS) == 2ULL * (GIN_IMM_SEQ_MASK + 1),
  * rotates to the next rail (so no single rail is pinned indefinitely). The
  * boundary op drops FI_MORE to flush the rail, then the pin advances. */
 #define GIN_REQS_PER_DOORBELL 16
-#define GIN_CXI_PAIR_DOORBELL_MIN (64 * 1024)
 static_assert(GIN_ACK_INTERVAL <= (GIN_IMM_SEQ_MASK >> 1),
 	      "GIN_ACK_INTERVAL must be much smaller than the seq window so "
 	      "ack-request hysteresis does not delay drain past wrap");
@@ -228,6 +227,8 @@ static_assert(sizeof(nccl_net_ofi_gin_signal_metadata_msg_t) == 32,
 	     "nccl_net_ofi_gin_signal_metadata_msg_t must be exactly 32 bytes for inline send");
 
 #define GIN_ACK_MSG_GRANTED_WINDOW_BITS 14
+#define GIN_CXI_EQ_EVENT_BUDGET 384
+#define GIN_CXI_PAIR_DOORBELL_MIN (64 * 1024)
 #define GIN_ACK_GRANT_MAX ((1U << GIN_ACK_MSG_GRANTED_WINDOW_BITS) - 1)
 #define GIN_ACK_MSG_RESERVED_BITS (64 - GIN_MSG_TYPE_BITS - GIN_IMM_COMM_BITS - GIN_RX_CONSUMED_BITS - GIN_ACK_MSG_GRANTED_WINDOW_BITS)
 
@@ -279,6 +280,16 @@ static_assert(
    against the receiver-granted window so grant shrink can never leave the
    sender blocked below a stale fixed gate. */
 #define GIN_ACK_REQ_THRESHOLD ((GIN_IMM_SEQ_MASK + 1) / 2)
+
+static inline uint32_t gin_cxi_eq_get_window_limit(uint32_t nranks)
+{
+	const uint32_t peers = nranks > 1 ? nranks - 1 : 0;
+	if (peers == 0) {
+		return GIN_IMM_SEQ_MASK + 1;
+	}
+	const uint32_t budget_per_peer = GIN_CXI_EQ_EVENT_BUDGET / peers;
+	return std::max<uint32_t>(1, budget_per_peer > 0 ? budget_per_peer - 1 : 0);
+}
 
 static_assert(GIN_TARGET_GRANTED_WINDOW <= GIN_ACK_GRANT_MAX,
 	      "GIN auto-sized target window must fit in the ACK grant field");

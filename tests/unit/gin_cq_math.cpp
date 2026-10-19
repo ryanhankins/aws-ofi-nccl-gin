@@ -76,6 +76,24 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	const struct {
+		uint32_t nranks;
+		uint32_t expected;
+	} eq_cases[] = {
+		{1, GIN_IMM_SEQ_MASK + 1},
+		{2, GIN_CXI_EQ_EVENT_BUDGET - 1},
+		{8, GIN_CXI_EQ_EVENT_BUDGET / 7 - 1},
+		{GIN_CXI_EQ_EVENT_BUDGET + 1, 1},
+		{1024, 1},
+	};
+	for (const auto &tc : eq_cases) {
+		if (gin_cxi_eq_get_window_limit(tc.nranks) != tc.expected) {
+			printf("CXI EQ limit failed: nranks=%u limit=%u expected=%u\n",
+			       tc.nranks, gin_cxi_eq_get_window_limit(tc.nranks), tc.expected);
+			return 1;
+		}
+	}
+
 	const cq_case cq_cases[] = {
 		{2, configured_reserve > 0 ? configured_reserve - 1 : 0, 1, false},
 		{2, configured_reserve, 1, false},

@@ -14,11 +14,14 @@
 void gin_flow_writedata_routed::init_peer(nccl_ofi_gin_peer_rank_info &peer, uint32_t peer_nranks)
 {
 	assert_always(peer_nranks == nranks);
-	peer.current_window_limit = resources.get_shared_cq_window_limit(nranks);
+	peer.current_window_limit = std::min(resources.get_shared_cq_window_limit(nranks),
+					     gin_cxi_eq_get_window_limit(nranks));
 }
 
-int gin_flow_writedata_routed::prepare_tx(nccl_ofi_gin_peer_rank_info &peer,
-			                  gin_tx_flow_decision &decision, gin_flow_context &ctx)
+int gin_flow_writedata_routed::prepare_tx(
+	nccl_ofi_gin_peer_rank_info &peer,
+	gin_tx_flow_decision &decision,
+	gin_flow_context &ctx)
 {
 	uint32_t outstanding = gin_cursor_delta(peer.tx_head, peer.tx_tail);
 	uint32_t current_window_limit = peer.current_window_limit;
@@ -58,12 +61,17 @@ void gin_flow_writedata_routed::prepare_ack(
 	uint32_t rx_consumed, gin_ack_msg_t &ack)
 {
 	gin_fill_ack_header(peer, rx_consumed, ack);
-	ack.granted_window = resources.get_shared_cq_window_limit(nranks);
+	ack.granted_window = std::min(
+		resources.get_shared_cq_window_limit(nranks),
+		gin_cxi_eq_get_window_limit(nranks));
 }
 
 void gin_flow_writedata_routed::process_ack(
 	nccl_ofi_gin_peer_rank_info &peer, const gin_ack_msg_t &ack)
 {
-	gin_apply_granted_window(peer, ack.granted_window);
+	gin_apply_granted_window(
+		peer, std::min<uint32_t>(static_cast<uint32_t>(ack.granted_window),
+					 gin_cxi_eq_get_window_limit(nranks)));
+
 	gin_complete_pending_ack_request(peer, ack.rx_consumed);
 }
