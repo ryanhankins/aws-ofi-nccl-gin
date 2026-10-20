@@ -72,6 +72,5 @@ void gin_flow_writedata_routed::process_ack(
 	gin_apply_granted_window(
 		peer, std::min<uint32_t>(static_cast<uint32_t>(ack.granted_window),
 					 gin_cxi_eq_get_window_limit(nranks)));
-
 	gin_complete_pending_ack_request(peer, ack.rx_consumed);
 }
