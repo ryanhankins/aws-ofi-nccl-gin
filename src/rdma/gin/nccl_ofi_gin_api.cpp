@@ -55,6 +55,10 @@ ncclResult_t nccl_ofi_gin_init(void **ctx, uint64_t commId, ncclDebugLogger_t lo
 		return ncclInternalError;
 	}
 
+	/* Providers that require FI_MR_ENDPOINT (e.g. CXI) have each MR bound to
+	   the GIN endpoint of the rail it was registered on; see
+	   nccl_ofi_rdma_gin_ep_t::reg_mr. */
+
 	/* GDR copy context is now a singleton, lazily initialized on first use.
 	 * GIN requires GDRCopy 2.5+ for forced PCIe copy support. */
 	try {
