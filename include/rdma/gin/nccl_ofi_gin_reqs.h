@@ -39,6 +39,10 @@ public:
 	virtual int handle_cq_entry(struct fi_cq_entry *cq_entry_base, fi_addr_t src_addr,
 				    uint16_t rail_id) = 0;
 
+	virtual void handle_cancel_completion()
+	{
+	}
+
 	/**
 	 * Callback to be invoked upon completion-with-error of the request
 	 *
@@ -108,6 +112,10 @@ public:
 	virtual int handle_cq_entry(struct fi_cq_entry *cq_entry_base, fi_addr_t src_addr,
 				    uint16_t rail_id) = 0;
 
+	virtual void handle_cancel_completion()
+	{
+	}
+
 #if HAVE_NVTX_TRACING || HAVE_LIBLTTNG_UST
 	/**
 	 * Set the trace information for LTTNG and NVTX
@@ -162,11 +170,26 @@ public:
 	 */
 	int post_or_add_pending();
 
+	bool has_outstanding_post() const
+	{
+		return posted;
+	}
+
+	void handle_cancel_completion() override
+	{
+		posted = false;
+	}
+
+	/** Request that Libfabric cancel this posted receive. */
+	void cancel();
+
 private:
 	nccl_ofi_gin_resources &resources;
 	nccl_ofi_gin_ep_rail_t &rail;
 
 	nccl_ofi_freelist::fl_entry *rx_buff_elem;
+	bool cancelled = false;
+	bool posted = false;
 };
 
 /**

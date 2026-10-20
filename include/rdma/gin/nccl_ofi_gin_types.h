@@ -283,7 +283,6 @@ struct gin_ack_msg {
 	/* Reserved for future use */
 	uint64_t reserved        : GIN_ACK_MSG_RESERVED_BITS;
 };
-using gin_ack_msg_t = gin_ack_msg;
 static_assert(sizeof(gin_ack_msg) <= 8,
 	      "gin_ack_msg must be exactly 8 bytes for inline send");
 

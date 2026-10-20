@@ -600,6 +600,17 @@ private:
 
 	/* Post all recv buffers for a given rail */
 	void post_rx_buffs_on_rail(nccl_ofi_gin_ep_rail_t &rail, size_t num_buffers);
+
+	/**
+	 * Best-effort cancel of every posted recv_reqs entry, followed by
+	 * draining the CQ so the (real or FI_ECANCELED) completions are
+	 * consumed before the caller deregisters the rx buffer MRs. Only
+	 * needed on the FI_MR_ENDPOINT teardown path, where the destructor
+	 * must fully retire outstanding fi_recv()s bound to those MRs before
+	 * rx_buff_fl deregisters them; see the destructor for the ordering
+	 * this protects.
+	 */
+	bool cancel_and_drain_recv_reqs();
 };
 
 #endif
