@@ -29,6 +29,11 @@ static inline void freelist_deleter(nccl_ofi_freelist *fl)
 	delete fl;
 }
 
+/* Upper bound on CQ polls while retiring cancelled receives at teardown.
+ * Cancellation normally completes within a few polls; the bound only keeps
+ * teardown from hanging on a provider that never reports it. */
+static constexpr size_t GIN_RECV_DRAIN_MAX_POLLS = 10000;
+
 /**
  * A rail of the GIN endpoint
  */
@@ -166,6 +171,13 @@ public:
 	 * should be done before memory can be deregistered.
 	 */
 	void close_ofi_eps();
+
+	/**
+	 * Drop the rails without closing their endpoints, AVs, or CQs. Only for
+	 * teardown when posted receives bound to endpoint MRs could not be
+	 * retired, so the provider objects must outlive this endpoint.
+	 */
+	void abandon_ofi_eps();
 
 	std::mutex ep_lock;
 private:
@@ -606,6 +618,16 @@ private:
 
 	/* Post all recv buffers for a given rail */
 	void post_rx_buffs_on_rail(nccl_ofi_gin_ep_rail_t &rail, size_t num_buffers);
+
+	/**
+	 * Cancel every posted recv_reqs entry and poll the CQ until each one
+	 * has completed (normally or with FI_ECANCELED), so rx_buff_fl can
+	 * deregister its endpoint-bound MRs. Used on FI_MR_ENDPOINT teardown.
+	 *
+	 * @return 0 when every receive is retired, -ETIMEDOUT after
+	 *	   GIN_RECV_DRAIN_MAX_POLLS polls, or the CQ processing error
+	 */
+	int cancel_and_drain_recv_reqs();
 };
 
 #endif

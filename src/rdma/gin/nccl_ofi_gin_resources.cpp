@@ -14,6 +14,8 @@
 #include "nccl_ofi_assert.h"
 #include <cinttypes>
 #include <cstdlib>
+#include <chrono>
+
 #include <thread>
 #if HAVE_CUDA
 #include "nccl_ofi_cuda.h"
@@ -56,6 +58,7 @@ nccl_ofi_gin_resources_registry &gin_resources_registry()
 	static nccl_ofi_gin_resources_registry registry;
 	return registry;
 }
+
 static inline struct fi_info *get_gin_info(struct fi_info *info);
 
 template <typename T>
@@ -137,7 +140,8 @@ nccl_ofi_rdma_gin_ep_t::nccl_ofi_rdma_gin_ep_t(nccl_net_ofi_domain_t &domain_arg
 			      GIN_TARGET_GRANTED_WINDOW);
 	}
 	if (cq_was_auto_capped) {
-		NCCL_OFI_WARN("GIN auto-sized RX CQ capped at %zu entries for nranks=%u; worst-case window=%u remains below target %u",
+		NCCL_OFI_WARN("GIN auto-sized RX CQ capped at %zu entries for nranks=%u; "
+			      "worst-case window=%u remains below target %u",
 			      configured_rx_cq_size, cq_sizing_nranks,
 			      cq_effective_window,
 			      GIN_TARGET_GRANTED_WINDOW);
@@ -264,6 +268,7 @@ int nccl_ofi_rdma_gin_ep_t::gin_process_cq_rail(uint16_t rail_id)
 	ssize_t rc = 0;
 	size_t iter = 0;
 	int ret = 0;
+	int total_processed = 0;
 
 	do {
 		++iter;
@@ -273,6 +278,7 @@ int nccl_ofi_rdma_gin_ep_t::gin_process_cq_rail(uint16_t rail_id)
 			ret = gin_process_completions(cqe_buffers, src_addrs, rc, rail_id);
 			if (OFI_UNLIKELY(ret != 0))
 				goto exit;
+			total_processed += rc;
 		} else if (OFI_UNLIKELY(rc == -FI_EAVAIL)) {
 			/*
 			 * On call to fi_cq_readerr, Libfabric requires some members of
@@ -309,7 +315,9 @@ int nccl_ofi_rdma_gin_ep_t::gin_process_cq_rail(uint16_t rail_id)
 					      err_entry.err, err_entry.prov_errno,
 					      fi_cq_strerror(rail_cq, err_entry.prov_errno,
 							     err_entry.err_data, NULL, 0));
-				ret = -(err_entry.err);
+				/* The failed write's segment can never retire, which would
+				 * stall the sender's window and ACKs, so the error is fatal. */
+				ret = err_entry.err != 0 ? -err_entry.err : -EIO;
 				goto exit;
 			}
 
@@ -319,6 +327,8 @@ int nccl_ofi_rdma_gin_ep_t::gin_process_cq_rail(uint16_t rail_id)
 			if (ret != 0) {
 				goto exit;
 			}
+			/* Error completions are completions too */
+			total_processed += 1;
 		} else if (rc == -FI_EAGAIN) {
 			/* No completions to process */
 			break;
@@ -331,6 +341,7 @@ int nccl_ofi_rdma_gin_ep_t::gin_process_cq_rail(uint16_t rail_id)
 		}
 	} while (iter < cq_process_max_iter);
 
+	ret = total_processed;
 exit:
 	return ret;
 }
@@ -338,21 +349,33 @@ exit:
 int nccl_ofi_rdma_gin_ep_t::process_cq()
 {
 	int ret = 0;
+	int total_processed = 0;
 
 	/* Process completion queues for all rails */
 	for (uint16_t rail_id = 0; rail_id < num_rails; ++rail_id) {
 		ret = gin_process_cq_rail(rail_id);
-		if (OFI_UNLIKELY(ret != 0)) {
+		if (OFI_UNLIKELY(ret < 0)) {
 			NCCL_OFI_WARN("Failed to process CQ for rail %u: %d", rail_id, ret);
 			return ret;
 		}
+		total_processed += ret;
 	}
 
-	return ret;
+	return total_processed;
 }
 
 void nccl_ofi_rdma_gin_ep_t::close_ofi_eps()
 {
+	rails.clear();
+}
+
+void nccl_ofi_rdma_gin_ep_t::abandon_ofi_eps()
+{
+	for (auto &rail : rails) {
+		static_cast<void>(rail.ofi_ep.release());
+		static_cast<void>(rail.av.release());
+		static_cast<void>(rail.rail_cq.release());
+	}
 	rails.clear();
 }
 
@@ -675,7 +698,8 @@ void nccl_ofi_gin_resources::post_rx_buffs_on_rail(nccl_ofi_gin_ep_rail_t &rail,
 	}
 }
 
-nccl_ofi_gin_resources::nccl_ofi_gin_resources(const std::shared_ptr<nccl_net_ofi_ep_t> &ep_arg, uint32_t nranks)
+nccl_ofi_gin_resources::nccl_ofi_gin_resources(
+	const std::shared_ptr<nccl_net_ofi_ep_t> &ep_arg, uint32_t nranks)
     : ep_holder(ep_arg),
       gin_ep(ep_arg->get_domain(), nranks),
       dev(ep_arg->get_domain().get_device()->dev_id),
@@ -871,31 +895,43 @@ nccl_ofi_gin_resources::~nccl_ofi_gin_resources()
 	}
 
 	/*
-	 * For non-FI_MR_ENDPOINT providers, we close the OFI endpoint here,
-	 * then let the remaining members clean up in reverse declaration
-	 * order.
+	 * For non-FI_MR_ENDPOINT providers, close the OFI endpoints here, then
+	 * let the remaining members clean up in reverse declaration order.
 	 *
-	 * For FI_MR_ENDPOINT providers, we skip closing the endpoint here so
-	 * that ack_send_fl and rx_buff_fl (whose MRs are bound to gin_ep) can
-	 * deregister those MRs before gin_ep tears down the bound endpoints
-	 * below, in reverse declaration order. This only satisfies the
-	 * constraint that bound endpoints must outlive their registered MRs;
-	 * it does not cancel the receive requests still posted against
-	 * rx_buff_fl's buffers (recv_reqs), so deregistration currently races
-	 * with those outstanding fi_recv()s. This mirrors the same known gap
-	 * documented in cm::endpoint::~endpoint(), and appears to work with
-	 * CXI, so is a reasonable first step; properly supporting
-	 * FI_MR_ENDPOINT will also require cancelling recv_reqs here first.
+	 * For FI_MR_ENDPOINT providers, the endpoints stay open so that
+	 * ack_send_fl and rx_buff_fl can deregister their endpoint-bound MRs
+	 * first; gin_ep closes the endpoints last (see the gin_ep declaration).
+	 * The receives posted from rx_buff_fl must be retired before its MRs
+	 * are deregistered. If they cannot be, deregistering the MRs or closing
+	 * the endpoints could leave the provider DMAing into freed memory, so
+	 * the receive buffers, their MRs, and the endpoints are leaked instead.
 	 */
 	if (!endpoint_mr) {
 		gin_ep.close_ofi_eps();
+		return;
+	}
+
+	int ret = cancel_and_drain_recv_reqs();
+	if (OFI_UNLIKELY(ret != 0)) {
+		NCCL_OFI_WARN("Failed to retire %zu posted GIN receives on device %d: %d. "
+			      "Leaking the receive buffers, their memory registrations, "
+			      "and the GIN endpoints they are bound to.",
+			      recv_reqs.size(),
+			      dev,
+			      ret);
+		/* Intentionally leaked: outstanding receives still reference
+		 * these requests and buffers as their operation context. */
+		static_cast<void>(
+			new std::vector<nccl_net_ofi_gin_recv_req_t>(std::move(recv_reqs)));
+		static_cast<void>(rx_buff_fl.release());
+		gin_ep.abandon_ofi_eps();
 	}
 }
 
 int nccl_ofi_gin_resources::progress()
 {
 	int ret = gin_ep.process_cq();
-	if (OFI_UNLIKELY(ret != 0)) {
+	if (OFI_UNLIKELY(ret < 0)) {
 		return ret;
 	}
 
@@ -917,4 +953,39 @@ int nccl_ofi_gin_resources::retry_pending_reqs()
 	}
 
 	return 0;
+}
+
+int nccl_ofi_gin_resources::cancel_and_drain_recv_reqs()
+{
+	/* Remove receives that have not yet posted so retry_pending_reqs cannot
+	 * repost them after cancellation begins. */
+	for (auto &req : recv_reqs) {
+		auto pending = std::find(pending_requests.begin(), pending_requests.end(), &req);
+		if (pending != pending_requests.end()) {
+			pending_requests.erase(pending);
+		}
+		req.cancel();
+	}
+
+	for (size_t attempt = 0; attempt < GIN_RECV_DRAIN_MAX_POLLS; ++attempt) {
+		const bool outstanding = std::any_of(recv_reqs.begin(), recv_reqs.end(),
+						      [](const auto &req) {
+							      return req.has_outstanding_post();
+						      });
+		if (!outstanding) {
+			return 0;
+		}
+		int ret = gin_ep.process_cq();
+		if (OFI_UNLIKELY(ret < 0)) {
+			NCCL_OFI_WARN("Error draining CQ while cancelling GIN receives: %d", ret);
+			return ret;
+		}
+		if (ret == 0) {
+			std::this_thread::yield();
+		}
+	}
+
+	NCCL_OFI_WARN("Timed out after %zu CQ polls draining cancelled GIN receives",
+		      GIN_RECV_DRAIN_MAX_POLLS);
+	return -ETIMEDOUT;
 }
