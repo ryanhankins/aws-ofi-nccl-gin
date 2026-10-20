@@ -1,0 +1,74 @@
+@@/ep_test -a ll -t 128 -d 7168
+@@/ep_test -a ht -L fl -t 4096 -d 7168
+@@/ep_test -a ht -L em -t 4096 -d 7168
+@@/ep_test -a ht -L fl -q -t 4096 -d 7168
+@@/ep_test -a ht -L em -q -t 4096 -d 7168
+@@/ep_bench --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate --datatype bf16
+@@/ep_bench --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp16
+@@/ep_bench --algorithm low-latency --layout em --tokens 256 --hidden 7168 --top-k 8 --experts 256 --validate --datatype bf16
+@@/ep_bench --algorithm low-latency --layout em --tokens 256 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp16
+@@/ep_bench --algorithm low-latency --layout em --tokens 1024 --hidden 7168 --top-k 8 --experts 256 --validate --datatype bf16
+@@/ep_bench --algorithm low-latency --layout em --tokens 1024 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp16
+@@/ep_bench --algorithm low-latency --layout em --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate --datatype bf16
+@@/ep_bench --algorithm low-latency --layout em --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp16
+@@/ep_bench --algorithm low-latency --layout rm --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate --datatype bf16
+@@/ep_bench --algorithm low-latency --layout rm --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp16
+@@/ep_bench --algorithm low-latency --layout rm --tokens 256 --hidden 7168 --top-k 8 --experts 256 --validate --datatype bf16
+@@/ep_bench --algorithm low-latency --layout rm --tokens 256 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp16
+@@/ep_bench --algorithm low-latency --layout rm --tokens 1024 --hidden 7168 --top-k 8 --experts 256 --validate --datatype bf16
+@@/ep_bench --algorithm low-latency --layout rm --tokens 1024 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp16
+@@/ep_bench --algorithm low-latency --layout rm --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate --datatype bf16
+@@/ep_bench --algorithm low-latency --layout rm --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp16
+@@/ep_bench --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp32
+@@/ep_bench --algorithm low-latency --layout em --tokens 256 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp32
+@@/ep_bench --algorithm low-latency --layout em --tokens 1024 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp32
+@@/ep_bench --algorithm low-latency --layout em --tokens 2048 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp32
+@@/ep_bench --algorithm low-latency --layout rm --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp32
+@@/ep_bench --algorithm low-latency --layout rm --tokens 256 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp32
+@@/ep_bench --algorithm low-latency --layout rm --tokens 1024 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp32
+@@/ep_bench --algorithm low-latency --layout rm --tokens 2048 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp32
+@@/ep_bench --algorithm low-latency --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate --dispatch-less-than-max-tokens 64
+@@/ep_bench --algorithm low-latency --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate --non-uniform-tokens
+@@/ep_bench --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 --dispatch-num-sms 21 --combine-num-sms 23 --validate
+@@/ep_bench --algorithm low-latency --layout rm --tokens 1 --hidden 2880 --top-k 4 --experts 128 --datatype bf16 --topk-idx-int32 --validate
+@@/ep_bench --algorithm low-latency --layout em --tokens 1 --hidden 2880 --top-k 4 --experts 128 --datatype bf16 --topk-idx-int32 --validate
+@@/ep_bench --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 31 --experts 256 --validate
+@@/ep_bench --algorithm low-latency --layout rm --tokens 128 --hidden 7168 --top-k 31 --experts 256 --validate
+@@/ep_bench --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 31 --experts 256 --topk-idx-int32 --validate
+@@/ep_bench --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate --dispatch-only --dispatch-quantization scales-forward --scales-forward-token-dtype fp8e4m3 --scales-forward-scale-dtype fp32
+@@/ep_bench --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate --dispatch-only --dispatch-quantization scales-forward --scales-forward-token-dtype bf16 --scales-forward-scale-dtype fp16
+@@/ep_bench --algorithm low-latency --layout rm --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate --dispatch-only --zcopy --dispatch-quantization scales-forward --scales-forward-token-dtype fp4x2 --scales-forward-scale-dtype uint8
+@@/ep_bench --algorithm low-latency --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate --dispatch-only --dispatch-quantization ds-fp8e3m4
+@@/ep_bench --algorithm high-throughput --layout fl --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate --datatype bf16
+@@/ep_bench --algorithm high-throughput --layout fl --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp16
+@@/ep_bench --algorithm high-throughput --layout fl --tokens 256 --hidden 7168 --top-k 8 --experts 256 --validate --datatype bf16
+@@/ep_bench --algorithm high-throughput --layout fl --tokens 256 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp16
+@@/ep_bench --algorithm high-throughput --layout fl --tokens 1024 --hidden 7168 --top-k 8 --experts 256 --validate --datatype bf16
+@@/ep_bench --algorithm high-throughput --layout fl --tokens 1024 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp16
+@@/ep_bench --algorithm high-throughput --layout fl --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate --datatype bf16
+@@/ep_bench --algorithm high-throughput --layout fl --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp16
+@@/ep_bench --algorithm high-throughput --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate --datatype bf16
+@@/ep_bench --algorithm high-throughput --layout em --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp16
+@@/ep_bench --algorithm high-throughput --layout em --tokens 256 --hidden 7168 --top-k 8 --experts 256 --validate --datatype bf16
+@@/ep_bench --algorithm high-throughput --layout em --tokens 256 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp16
+@@/ep_bench --algorithm high-throughput --layout em --tokens 1024 --hidden 7168 --top-k 8 --experts 256 --validate --datatype bf16
+@@/ep_bench --algorithm high-throughput --layout em --tokens 1024 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp16
+@@/ep_bench --algorithm high-throughput --layout em --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate --datatype bf16
+@@/ep_bench --algorithm high-throughput --layout em --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate --datatype fp16
+@@/ep_bench --algorithm high-throughput --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate --dispatch-less-than-max-tokens 2048
+@@/ep_bench --algorithm high-throughput --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate --non-uniform-tokens
+@@/ep_bench --algorithm high-throughput --layout fl --tokens 128 --hidden 7168 --top-k 8 --experts 256 --dispatch-num-sms 15 --combine-num-sms 17 --validate
+@@/ep_bench --algorithm high-throughput --layout fl --tokens 128 --hidden 7168 --top-k 8 --experts 256 --validate --dispatch-only --zcopy --dispatch-quantization scales-forward --scales-forward-token-dtype fp4x2 --scales-forward-scale-dtype uint8
+NCCL_EP_HT_EM_PULL_PUSH=1 @@/ep_bench --algorithm high-throughput --layout em --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate
+NCCL_EP_HT_EM_PULL_PUSH=1 @@/ep_bench --algorithm high-throughput --layout em --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate --dispatch-only --mxfp8
+@@/ep_bench --algorithm high-throughput --layout em --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate --combine-quantization mxfp8
+@@/ep_bench --algorithm high-throughput --layout em --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate --mxfp8
+@@/ep_bench --algorithm high-throughput --layout em --tokens 4096 --hidden 7168 --top-k 8 --experts 256 --validate --backward --combine-quantization mxfp8
+@@/ep_bench --algorithm high-throughput --layout fl --tokens 128 --hidden 3584 --top-k 8 --experts 256 --validate --datatype fp32
+@@/ep_bench --algorithm high-throughput --layout fl --tokens 256 --hidden 3584 --top-k 8 --experts 256 --validate --datatype fp32
+@@/ep_bench --algorithm high-throughput --layout fl --tokens 1024 --hidden 3584 --top-k 8 --experts 256 --validate --datatype fp32
+@@/ep_bench --algorithm high-throughput --layout fl --tokens 2048 --hidden 3584 --top-k 8 --experts 256 --validate --datatype fp32
+@@/ep_bench --algorithm high-throughput --layout em --tokens 128 --hidden 3584 --top-k 8 --experts 256 --validate --datatype fp32
+@@/ep_bench --algorithm high-throughput --layout em --tokens 256 --hidden 3584 --top-k 8 --experts 256 --validate --datatype fp32
+@@/ep_bench --algorithm high-throughput --layout em --tokens 1024 --hidden 3584 --top-k 8 --experts 256 --validate --datatype fp32
+@@/ep_bench --algorithm high-throughput --layout em --tokens 2048 --hidden 3584 --top-k 8 --experts 256 --validate --datatype fp32

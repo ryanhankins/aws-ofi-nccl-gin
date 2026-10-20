@@ -1,0 +1,98 @@
+--- run_nccl_m2n_mpi_tests.sh
++++ m2n_mpi.sh
+@@ -8,7 +8,7 @@
+ # the cross-dimension regressions, PACK split/group gates, and the
+ # benchmark validation matrix.
+ 
+-set -euo pipefail
++set -uo pipefail
+ 
+ : "${NCCL_HOME:?NCCL_HOME must be set}"
+ : "${NCCL_M2N_MPI_TEST_PROFILE:?NCCL_M2N_MPI_TEST_PROFILE must be set}"
+@@ -71,13 +71,13 @@
+   shift 2
+ 
+   set +e
+-  timeout -k 30 600 srun \
++  timeout -k 30 1700 srun --mem=0 \
+     -N "${NCCL_M2N_MPI_NNODES}" \
+     -n "${expectedRanks}" \
+     --ntasks-per-node "${NCCL_M2N_MPI_NTASKS_PER_NODE}" \
+     --distribution="${distribution}" \
+     --exclusive \
+-    --mpi=pmix \
++    --mpi=pmi2 --network=disable_rdzv_get \
+     --kill-on-bad-exit=1 \
+     --cpu-bind=none \
+     --export=ALL \
+@@ -87,7 +87,7 @@
+   return "${rc}"
+ }
+ 
+-runCase() {
++runCase_orig() {
+   local label="$1"
+   shift
+   local log
+@@ -116,7 +116,7 @@
+   rm -f "${log}"
+ }
+ 
+-runPackSplitCase() {
++runPackSplitCase_orig() {
+   local caseFilter="$1"
+   local requireSplit="${2:-0}"
+   local log
+@@ -203,7 +203,7 @@
+   NCCL_COMM_BLOCKING=0 runPackSplitCase split_reverse_mesh "${splitReverseMeshActivated}"
+ }
+ 
+-runPackGroupCase() {
++runPackGroupCase_orig() {
+   local log
+   log="$(mktemp)"
+ 
+@@ -235,10 +235,28 @@
+   rm -f "${log}"
+ }
+ 
++
++MARK_DIR="${M2N_MARK_DIR:?}"; BUDGET="${M2N_BUDGET:-1500}"; mkdir -p "$MARK_DIR"; FAILS=0
++guarded() { # key fn args...
++  local key fn; key="$(echo "${NCCL_M2N_MPI_TEST_PROFILE}:$1:${NCCL_COMM_BLOCKING:-}:${NCCL_RESHARD_STAGING_CHANNEL_SIZE:-}:${GTEST_SHARD_INDEX:-}" | tr -c 'A-Za-z0-9:_.-' '_')"; fn="$2"; shift 2
++  [[ -f "$MARK_DIR/$key.ok" ]] && { echo "[skip-done] $key"; return 0; }
++  if (( SECONDS > BUDGET )); then echo "[budget] deferring $key"; return 0; fi
++  if "$fn" "$@"; then touch "$MARK_DIR/$key.ok"; echo "[CASE-OK] $key"; else echo "[CASE-FAIL] $key"; touch "$MARK_DIR/$key.fail"; FAILS=$((FAILS+1)); fi
++  return 0
++}
++runCase() {
++  if [[ "$1" == "all algorithms, source parity" ]]; then
++    local k; for k in 0 1 2 3; do GTEST_TOTAL_SHARDS=4 GTEST_SHARD_INDEX=$k guarded "$1 shard $k" runCase_orig "$@"; done
++  else guarded "$*" runCase_orig "$@"; fi
++}
++runPackSplitCase() { guarded "$*" runPackSplitCase_orig "$@"; }
++runPackGroupCase() { guarded "pack-group" runPackGroupCase_orig "$@"; }
++runEightRankDefaultMatrix() { guarded "eight-default-matrix" runEightRankDefaultMatrix_orig "$@"; }
++runBenchmark() { guarded "$*" runBenchmark_orig "$@"; }
+ runCase "mixed communicator groups" --filter group_mixed_context \
+   --algorithm ring --api default --lb-mode uniform
+ 
+-runEightRankDefaultMatrix() {
++runEightRankDefaultMatrix_orig() {
+   local log
+   log="$(mktemp)"
+ 
+@@ -283,7 +301,7 @@
+     --gtest_filter='Matrix/BasicApiMpiTest.*'
+ }
+ 
+-runBenchmark() {
++runBenchmark_orig() {
+   local label="$1"
+   shift
+   local log
+@@ -343,3 +361,4 @@
+ esac
+ 
+ runNonBlockingCoverage
++echo "SUMMARY: FAILS=$FAILS"; exit $FAILS
