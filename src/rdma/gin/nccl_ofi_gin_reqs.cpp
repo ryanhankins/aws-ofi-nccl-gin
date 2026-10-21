@@ -22,33 +22,19 @@ int nccl_net_ofi_gin_op_req_t::op_req_ctx::handle_error_entry(struct fid_cq *cq,
 							      uint16_t rail_id)
 {
 	int ret = 0;
+	nccl_net_ofi_gin_op_req_t *req = cpp_container_of(this, &nccl_net_ofi_gin_op_req_t::ctx);
 
 	if (err_entry->err == FI_ECANCELED) {
-		/* Closing an EP with posted receives will (erroneously) generate
-		   cancellation events for the posted receives with the EFA provider
-		   in Libfabric versions prior to 1.22. These events are harmless
-		   and can be ignored.
-
-		   With Libfabric 1.22 and later, we shouldn't get these cancel
-		   events at all. The plugin does not explicitly call fi_cancel. */
+		/* Cancellation completions retire posted receives before their MRs are released. */
+		req->handle_cancel_completion();
 		return 0;
 	}
-
-	nccl_net_ofi_gin_op_req_t *req = cpp_container_of(this, &nccl_net_ofi_gin_op_req_t::ctx);
 
 	NCCL_OFI_WARN(
 		"Request %p completed with error. RC: %d. Flags: %ld. Error: %d (%s). Completed length: %ld",
 		req, err_entry->err, err_entry->flags, err_entry->prov_errno,
 		fi_cq_strerror(cq, err_entry->prov_errno, err_entry->err_data, NULL, 0),
 		(long)err_entry->len);
-
-	/*
-	 * Libfabric error codes directly map to ISO C errno values for standard
-	 * error codes up to FI_ERRNO_OFFSET, and libfabric-specific error codes
-	 * beyond. nccl_net_ofi_retval_translate() will figure out how to deal
-	 * with these, so it is safe to pass up the err with its sign negated.
-	 * However, any special-handling for prov_errno should be handled here.
-	 */
 	ret = -(err_entry->err);
 	return ret;
 }
@@ -90,25 +76,51 @@ int nccl_net_ofi_gin_recv_req_t::handle_cq_entry(struct fi_cq_entry *cq_entry_ba
 	auto *cq_entry = reinterpret_cast<struct fi_cq_data_entry *>(cq_entry_base);
 
 	int ret = 0;
+	this->posted = false;
+
+	/* If cancelled during teardown, do not process or repost this req */
+	if (OFI_UNLIKELY(this->cancelled)) {
+		return 0;
+	}
 
 	if (cq_entry->flags & FI_REMOTE_WRITE) {
-		/* RDMA write-immediate completion */
+		/* RDMA write-immediate completion. On providers that negotiate
+		 * FI_RX_CQ_DATA (e.g. EFA), unsolicited writedata completions are
+		 * only ever delivered against a posted fi_recv(), so this request's
+		 * op_context is valid here. Providers that don't require the mode
+		 * bit route writedata completions before op_context dispatch (see
+		 * nccl_ofi_rdma_gin_ep_t::gin_process_completions_writedata_routed())
+		 * and never reach this path. */
 		uint16_t comm_id = GIN_IMM_GET_COMM_ID(cq_entry->data);
-		auto &gin_comm = resources.get_comm(comm_id);
+		auto *gin_comm = resources.find_comm(comm_id);
+		if (OFI_UNLIKELY(gin_comm == nullptr)) {
+			NCCL_OFI_WARN(
+				"Dropping posted-recv GIN remote-write completion "
+				"for stale comm_id %u on rail %hu",
+				comm_id, rail_id_arg);
+			return post_or_add_pending();
+		}
 
-		ret = gin_comm.handle_signal_write_completion(cq_entry, src_addr, rail_id_arg);
+		ret = gin_comm->handle_signal_write_completion(cq_entry, src_addr, rail_id_arg);
 		if (ret != 0) {
 			NCCL_OFI_WARN("gin_handle_signal_write_completion failure");
 			return ret;
 		}
 	} else {
 		/* Dispatch by msg_type — at offset 0 in both message structs. */
-		auto *ack_msg = static_cast<gin_ack_msg_t *>(rx_buff_elem->ptr);
+		auto *ack_msg = static_cast<gin_ack_msg *>(rx_buff_elem->ptr);
 		auto msg_type = static_cast<gin_msg_type_t>(ack_msg->msg_type);
 		if (msg_type == GIN_MSG_TYPE_ACK) {
-			auto &gin_comm = resources.get_comm(ack_msg->ack_comm_id);
+			auto *gin_comm = resources.find_comm(ack_msg->ack_comm_id);
+			if (OFI_UNLIKELY(gin_comm == nullptr)) {
+				NCCL_OFI_WARN(
+					"Dropping posted-recv GIN ACK message "
+					"for stale ack_comm_id %u on rail %hu",
+					ack_msg->ack_comm_id, rail_id_arg);
+				return post_or_add_pending();
+			}
 
-			ret = gin_comm.handle_ack_completion(ack_msg, src_addr, rail_id_arg);
+			ret = gin_comm->handle_ack_completion(ack_msg, src_addr, rail_id_arg);
 			if (OFI_UNLIKELY(ret != 0)) {
 				NCCL_OFI_WARN("handle_ack_completion failure");
 				return ret;
@@ -117,9 +129,16 @@ int nccl_net_ofi_gin_recv_req_t::handle_cq_entry(struct fi_cq_entry *cq_entry_ba
 			auto *msg = static_cast<nccl_net_ofi_gin_signal_metadata_msg_t *>(
 				rx_buff_elem->ptr);
 
-			auto &gin_comm = resources.get_comm(msg->header.remote_comm_id);
+			auto *gin_comm = resources.find_comm(msg->header.remote_comm_id);
+			if (OFI_UNLIKELY(gin_comm == nullptr)) {
+				NCCL_OFI_WARN(
+					"Dropping posted-recv GIN metadata message "
+					"for stale remote_comm_id %u on rail %hu",
+					msg->header.remote_comm_id, rail_id_arg);
+				return post_or_add_pending();
+			}
 
-			ret = gin_comm.handle_signal_metadata_completion(msg, src_addr,
+			ret = gin_comm->handle_signal_metadata_completion(msg, src_addr,
 									 rail_id_arg);
 			if (ret != 0) {
 				NCCL_OFI_WARN(
@@ -138,12 +157,17 @@ int nccl_net_ofi_gin_recv_req_t::handle_cq_entry(struct fi_cq_entry *cq_entry_ba
 
 int nccl_net_ofi_gin_recv_req_t::post()
 {
+	if (cancelled) {
+		posted = false;
+		return 0;
+	}
 	auto *mr_handle = static_cast<nccl_ofi_gin_mr_handle_t *>(rx_buff_elem->mr_handle);
 	struct fid_ep *ofi_ep = rail.ofi_ep.get();
 	size_t size = sizeof(nccl_net_ofi_gin_signal_metadata_msg_t);
 	void *desc = fi_mr_desc(mr_handle->get_mr(rail.rail_id));
 
 	ssize_t rc = fi_recv(ofi_ep, rx_buff_elem->ptr, size, desc, FI_ADDR_UNSPEC, &ctx.ofi_ctx);
+	posted = rc == 0;
 	if (rc != 0 && rc != -FI_EAGAIN) {
 		NCCL_OFI_WARN("Failed to post recv. RC: %zd", rc);
 	}
@@ -162,6 +186,18 @@ int nccl_net_ofi_gin_recv_req_t::post_or_add_pending()
 	return ret;
 }
 
+void nccl_net_ofi_gin_recv_req_t::cancel()
+{
+	this->cancelled = true;
+	/* Return value intentionally ignored: fi_cancel() is best-effort (the
+	 * provider may return -FI_ENOSYS or silently no-op), and either way
+	 * the eventual completion (real or FI_ECANCELED) still arrives via
+	 * the CQ, which is what the caller drains on. */
+	if (posted) {
+		fi_cancel(&rail.ofi_ep->fid, &ctx.ofi_ctx);
+	}
+}
+
 int nccl_net_ofi_gin_sendack_req_t::handle_cq_entry(struct fi_cq_entry * /*cq_entry_base*/,
 						     fi_addr_t /*src_addr*/,
 						     uint16_t /*rail_id_arg*/)
@@ -178,7 +214,7 @@ int nccl_net_ofi_gin_sendack_req_t::post()
 	auto *ack_handle =
 		static_cast<nccl_ofi_gin_mr_handle_t *>(ack_elem->mr_handle);
 
-	ssize_t rc = fi_send(ep, ack_elem->ptr, sizeof(gin_ack_msg_t),
+	ssize_t rc = fi_send(ep, ack_elem->ptr, sizeof(gin_ack_msg),
 			     fi_mr_desc(ack_handle->get_mr(rail_id)), remote_addr,
 			     &ctx.ofi_ctx);
 
@@ -255,7 +291,34 @@ int nccl_net_ofi_gin_write_req_t::post()
 	msg.context = &ctx.ofi_ctx;
 	msg.data = imm_data;
 
-	ssize_t rc = fi_writemsg(ep, &msg, flags);
+	ssize_t rc;
+	if (endpoint_mr) {
+		/* Endpoint-MR providers (CXI) do not accept FI_REMOTE_CQ_DATA in
+		   fi_writemsg flags; remote CQ data goes through fi_writedata
+		   (requires FI_CXI_ENABLE_WRITEDATA=1). */
+		/* fi_writedata() takes no per-op flags and posts with the endpoint's
+		   default transmit flags. To defer the doorbell (FI_MORE) so it is
+		   batched with the metadata send that follows, set FI_MORE on the
+		   endpoint for just this call and restore it afterwards (other ops,
+		   e.g. fi_read, also read these defaults). Caller holds the ep lock. */
+		const bool more = (flags & FI_MORE) != 0;
+		uint64_t cur = FI_TRANSMIT;
+		bool restore = false;
+		if (more && fi_control(&ep->fid, FI_GETOPSFLAG, &cur) == 0) {
+			/* Keep the existing flags (notably FI_COMPLETION): SETOPSFLAG
+			   replaces them wholesale. */
+			uint64_t with_more = cur | FI_TRANSMIT | FI_MORE;
+			cur |= FI_TRANSMIT;
+			restore = (fi_control(&ep->fid, FI_SETOPSFLAG, &with_more) == 0);
+		}
+		rc = fi_writedata(ep, src, size, desc, imm_data, remote_addr, dest, key,
+				  &ctx.ofi_ctx);
+		if (restore) {
+			(void)fi_control(&ep->fid, FI_SETOPSFLAG, &cur);
+		}
+	} else {
+		rc = fi_writemsg(ep, &msg, flags);
+	}
 
 	/* Drop FI_MORE for retry — must not remain pending in the queue */
 	flags &= ~FI_MORE;

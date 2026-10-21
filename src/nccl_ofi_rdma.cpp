@@ -3043,29 +3043,6 @@ int nccl_net_ofi_rdma_domain_t::dereg_mr_no_lock(nccl_net_ofi_rdma_mr_handle_t *
 }
 
 
-int nccl_net_ofi_rdma_domain_t::mr_bind_and_enable(struct fid_mr *mr,
-						   struct fid_ep *ofi_ep,
-						   uint16_t rail_id,
-						   const char *rail_type)
-{
-	int ret = fi_mr_bind(mr, &ofi_ep->fid, 0);
-	if (ret != 0) {
-		NCCL_OFI_WARN("fi_mr_bind (%s rail %u) failed: rc=%d, error=%s",
-			      rail_type, rail_id, ret, fi_strerror(-ret));
-		return ret;
-	}
-
-	ret = fi_mr_enable(mr);
-	if (ret != 0) {
-		NCCL_OFI_WARN("fi_mr_enable failed on %s rail %u with rc=%d, error=%s",
-			      rail_type, rail_id, ret, fi_strerror(-ret));
-		return ret;
-	}
-
-	return 0;
-}
-
-
 int nccl_net_ofi_rdma_domain_t::reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
 						 int type,
 						 nccl_net_ofi_rdma_ep_t *ep,
@@ -3128,8 +3105,9 @@ int nccl_net_ofi_rdma_domain_t::reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
 		if (ep != nullptr) {
 			nccl_net_ofi_rdma_ep_rail_t *ep_rail = ep->rdma_endpoint_get_rail(rail_id);
 			struct fid_ep *ofi_ep = ep_rail->ofi_ep.get();
-			ret = mr_bind_and_enable(ret_handle->mr_data[rail_id].get(), ofi_ep,
-						 rail_id, "data");
+			ret = nccl_ofi_ofiutils_mr_bind_and_enable(
+				ret_handle->mr_data[rail_id].get(), ofi_ep,
+				rail_id, "data");
 			if (ret != 0) goto error;
 		}
 	}
@@ -3153,8 +3131,9 @@ int nccl_net_ofi_rdma_domain_t::reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
 
 			nccl_net_ofi_rdma_ep_rail_t *ctrl_rail = ep->rdma_endpoint_get_control_rail(rail_id);
 			struct fid_ep *ctrl_ofi_ep = ctrl_rail->ofi_ep.get();
-			ret = mr_bind_and_enable(ret_handle->mr_ctrl_owned[rail_id].get(), ctrl_ofi_ep,
-						 rail_id, "ctrl");
+			ret = nccl_ofi_ofiutils_mr_bind_and_enable(
+				ret_handle->mr_ctrl_owned[rail_id].get(), ctrl_ofi_ep,
+				rail_id, "ctrl");
 			if (ret != 0) goto error;
 
 			ret_handle->mr_ctrl[rail_id] = ret_handle->mr_ctrl_owned[rail_id].get();

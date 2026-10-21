@@ -745,6 +745,10 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		 * with fewer than global_n_sc sc EPs leaves the surplus slots
 		 * as nullptr (zero address). This is also the target-slot layout
 		 * of each poster's target addressing table. */
+		/* Thread this through for consistency with the writedata-routed CQ sizing
+		 * work; GDAKI windowing does not consult it today, so this is a
+		 * behavior no-op on this path. */
+		const size_t configured_rx_cq_size = ofi_nccl_cq_size();
 		const size_t total_slots = 1 + (size_t)global_n_sc;
 		for (int ctx_id = 0; ctx_id < nContexts; ctx_id++) {
 			/* This context's endpoints open on rail
@@ -765,11 +769,9 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			/* The data endpoint issues both Put and Get, so it counts reads too. */
 			/* Put and Get carry their payload through the SGE, so the data
 			 * endpoint keeps the 64B entry and the full SQ depth. */
-			ctx->data[ctx_id]->open(ofi_domain,
-						proxy_info,
-						gda_ops,
-						FI_WRITE | FI_READ,
-						/* inline_write_size */ 0);
+			ctx->data[ctx_id]->open(ofi_domain, proxy_info, gda_ops,
+				       FI_WRITE | FI_READ, configured_rx_cq_size,
+				       /* inline_write_size */ 0);
 			if (local_n_sc > 0) {
 				ctx->sc_endpoints[ctx_id].reserve(local_n_sc);
 			}
@@ -778,7 +780,9 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 				/* Slot i serves as counter i while i < nCounters and as
 				 * signal i while i < nSignals, so it takes a counter for
 				 * each role it fills. */
-				ctx->sc_endpoints[ctx_id][i]->open(ofi_domain, proxy_info, gda_ops,
+				ctx->sc_endpoints[ctx_id][i]->open(ofi_domain, proxy_info,
+								   gda_ops,
+								   configured_rx_cq_size,
 								   i < config->nCounters,
 								   i < config->nSignals);
 			}
@@ -787,8 +791,8 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			/* Backend version 2 and later carry up to eight bytes as WQE
 			 * inline data, so their PutValue endpoint takes the wide entry
 			 * (at half SQ depth). Backend version 1 keeps the narrow entry. */
-			ctx->pvdata[ctx_id]->open(
-				ofi_domain, proxy_info, gda_ops, FI_WRITE, putvalue_inline_size);
+			ctx->pvdata[ctx_id]->open(ofi_domain, proxy_info, gda_ops, FI_WRITE,
+				       configured_rx_cq_size, putvalue_inline_size);
 
 			/*
 			 * Step 5: Exchange ALL of this ctx's endpoint addresses in a

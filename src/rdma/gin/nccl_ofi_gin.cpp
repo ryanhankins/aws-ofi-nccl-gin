@@ -4,6 +4,7 @@
 
 #include "config.h"
 
+#include <algorithm>
 #include <mutex>
 #include <thread>
 
@@ -35,10 +36,13 @@ struct gin_connect_handle {
 	nccl_ofi_addr ep_names[MAX_NUM_RAILS];
 };
 
+static inline int gin_flow_progress_tx(nccl_ofi_rdma_gin_put_comm &comm);
+
 nccl_ofi_rdma_gin_put_comm::nccl_ofi_rdma_gin_put_comm(std::shared_ptr<nccl_ofi_gin_resources> resources_arg, int rank_, int nranks_,
 				     nccl_net_ofi_send_comm *s_comm_,
 				     nccl_net_ofi_recv_comm *r_comm_)
     : resources_sp(std::move(resources_arg)),
+      resource_releaser(*resources_sp),
       metadata_fl(nullptr, &freelist_deleter), dev(s_comm_->dev_id),
       rank(rank_), nranks(nranks_),
       ag_comm(s_comm_, r_comm_, rank_, nranks_)
@@ -54,49 +58,77 @@ nccl_ofi_rdma_gin_put_comm::nccl_ofi_rdma_gin_put_comm(std::shared_ptr<nccl_ofi_
 
 	metadata_fl.reset(metadata_fl_ptr);
 
-#if HAVE_NVTX_TRACING
-	if (ofi_nccl_nvtx_trace_dimension() == NVTX_TRACE_DIMENSION::PER_COMM) {
-		for (int i = 0; i < NCCL_OFI_N_NVTX_DOMAIN_PER_COMM; ++i) {
-			char name[64];
-			snprintf(name, 64, "aws-ofi-nccl gin_comm %p_%d", this, i);
-			this->nvtx_domain[i] = nvtxDomainCreateA(name);
-		}
-	}
-#endif
-
-	size_t comm_id = get_resources().alloc_comm_id(); /* TODO free */
+	size_t comm_id = get_resources().alloc_comm_id();
 	if (OFI_UNLIKELY(comm_id == FI_KEY_NOTAVAIL)) {
-		NCCL_OFI_WARN("No comm id available");
-		throw std::runtime_error("No comm id available");
+		NCCL_OFI_WARN("No GIN communicator IDs remain for this endpoint resource lifetime");
+		throw std::runtime_error("No GIN communicator IDs remain for this "
+					"endpoint resource lifetime");
 	}
-	this->local_comm_id = comm_id;
+	this->local_comm_id = static_cast<uint32_t>(comm_id);
+	auto &resources = get_resources();
+	bool comm_registered = false;
+	bool ref_counted = false;
+	try {
+#if HAVE_NVTX_TRACING
+		if (ofi_nccl_nvtx_trace_dimension() == NVTX_TRACE_DIMENSION::PER_COMM) {
+			for (int i = 0; i < NCCL_OFI_N_NVTX_DOMAIN_PER_COMM; ++i) {
+				char name[64];
+				snprintf(name, 64, "aws-ofi-nccl gin_comm %p_%d", this, i);
+				this->nvtx_domain[i] = nvtxDomainCreateA(name);
+			}
+		}
+#endif
+		flow_policy = resources.get_ep().make_flow_policy(resources, nranks);
+		flow_ctx.conservative_refresh_window = 1;
+		flow_ctx.progress_comm = this;
+		flow_ctx.progress_fn = gin_flow_progress_tx;
 
-	get_resources().set_comm(local_comm_id, *this);
+		resources.set_comm(local_comm_id, *this);
+		comm_registered = true;
 
 #if HAVE_CUDA
-	/* Capture the app's context on this context-bearing thread so discovery
-	 * can rebind it on NCCL's context-less GIN progress thread. The app owns
-	 * it and it outlives this comm. */
-	if (nccl_net_ofi_gpu_get_current_context(&gdrcopy_cuda_ctx) != 0 ||
-	    gdrcopy_cuda_ctx == nullptr) {
-		NCCL_OFI_WARN("Could not capture a CUDA context; GPU signal "
-			      "delivery may fail");
-		gdrcopy_cuda_ctx = nullptr;
-	}
+		/* Capture the app's context on this context-bearing thread so discovery
+		 * can rebind it on NCCL's context-less GIN progress thread. The app owns
+		 * it and it outlives this comm. */
+		if (nccl_net_ofi_gpu_get_current_context(&gdrcopy_cuda_ctx) != 0 ||
+		    gdrcopy_cuda_ctx == nullptr) {
+			NCCL_OFI_WARN("Could not capture a CUDA context; "
+			       "GPU signal delivery may fail");
+			gdrcopy_cuda_ctx = nullptr;
+		}
 #endif
 
-	/* Ensure the single process-wide gdrcopy worker exists. It is spawned
-	 * lazily on the first comm and runs until process teardown; later comms
-	 * just attach to it. A spawn failure (thread/FD exhaustion) is fatal:
-	 * rather than silently fall back to running gdrcopy on the proxy thread,
-	 * fail comm creation so we never run in that degraded configuration.
-	 * Undo the comm registration before rethrowing so resources teardown
-	 * does not see a dangling comm. */
-	try {
-		(void)nccl_ofi_gin_gdrcopy_worker::get();
-	} catch (const std::exception &err) {
-		NCCL_OFI_WARN("Failed to start GIN gdrcopy worker: %s", err.what());
-		get_resources().remove_comm(local_comm_id);
+		/* The worker is process-wide and outlives every GIN comm. */
+		try {
+			(void)nccl_ofi_gin_gdrcopy_worker::get();
+		} catch (const std::exception &err) {
+			NCCL_OFI_WARN("Failed to start GIN gdrcopy worker: %s", err.what());
+			throw;
+		}
+
+		ref_counted = true;
+		resources.increment_ref_cnt();
+		rank_comms.resize(nranks);
+		for (auto &peer : rank_comms) {
+			flow_policy->init_peer(peer, nranks);
+		}
+		resource_releaser.activate();
+	} catch (...) {
+		if (comm_registered) {
+			resources.remove_comm(local_comm_id);
+		}
+		if (ref_counted) {
+			resources.release();
+		}
+		resources.rollback_unpublished_comm_id(comm_id);
+#if HAVE_NVTX_TRACING
+		for (int i = 0; i < NCCL_OFI_N_NVTX_DOMAIN_PER_COMM; ++i) {
+			if (this->nvtx_domain[i] != nullptr) {
+				nvtxDomainDestroy(this->nvtx_domain[i]);
+				this->nvtx_domain[i] = nullptr;
+			}
+		}
+#endif
 		throw;
 	}
 }
@@ -164,7 +196,11 @@ int nccl_ofi_rdma_gin_listen_comm::connect(nccl_net_ofi_conn_handle_t *handles[]
 
 	NCCL_OFI_TRACE(NCCL_NET, "gin: connect() nranks %d rank %d", nranks, rank);
 
-	assert(nranks > 0);
+	if (OFI_UNLIKELY(!gin_rank_count_is_valid(nranks, endpoint_mr))) {
+		NCCL_OFI_WARN("GIN communicator size %d exceeds the endpoint-MR rank field",
+			      nranks);
+		return -EINVAL;
+	}
 
 	nccl_net_ofi_send_comm *s_comm = nullptr;
 	nccl_net_ofi_recv_comm *r_comm = nullptr;
@@ -197,7 +233,8 @@ int nccl_ofi_rdma_gin_listen_comm::connect(nccl_net_ofi_conn_handle_t *handles[]
 
 	/* Look up (or create on first use) the GIN resources for this endpoint.
 	   GIN owns this association; the net endpoint does not know about GIN. */
-	std::shared_ptr<nccl_ofi_gin_resources> resources = gin_resources_registry().get(ep);
+	std::shared_ptr<nccl_ofi_gin_resources> resources =
+		gin_resources_registry().get(ep, nranks);
 
 	nccl_ofi_rdma_gin_put_comm *gin_comm =
 		new nccl_ofi_rdma_gin_put_comm(resources, rank, nranks, s_comm, r_comm);
@@ -215,8 +252,6 @@ int nccl_ofi_rdma_gin_listen_comm::connect(nccl_net_ofi_conn_handle_t *handles[]
 	for (int i = 0; i < num_rails; ++i) {
 		set_rail_address(gin_ep.get_rail(i), my_gin_handle.ep_names[i]);
 	}
-
-	gin_comm->rank_comms.resize(nranks);
 
 	/* Pre-allocate rank_map vectors for direct fi_addr_t indexing.
 	 * UINT32_MAX serves as "not populated" sentinel. */
@@ -258,18 +293,16 @@ int nccl_ofi_rdma_gin_listen_comm::connect(nccl_net_ofi_conn_handle_t *handles[]
 	return 0;
 }
 
-int nccl_ofi_rdma_gin_put_comm::send_ack(nccl_ofi_rdma_gin_put_comm &gin_comm, uint32_t peer_rank,
-			       uint32_t rx_consumed)
+int nccl_ofi_rdma_gin_put_comm::send_ack(uint32_t peer_rank, const gin_ack_msg &ack_msg)
 {
 	/* For now, always send acks on rail 0.
 	   TODO round-robin this like the payload data itself. */
 	const int rail_id = 0;
 
-	auto &rank_comm = gin_comm.rank_comms[peer_rank];
-	uint32_t peer_comm_id = rank_comm.comm_id;
+	auto &rank_comm = rank_comms[peer_rank];
 
-	auto &ep = gin_comm.get_resources().get_ep();
-	auto *ack_fl = gin_comm.get_resources().get_ack_send_fl();
+	auto &ep = get_resources().get_ep();
+	auto *ack_fl = get_resources().get_ack_send_fl();
 
 	auto *ack_elem = ack_fl->entry_alloc();
 	if (!ack_elem) {
@@ -277,32 +310,32 @@ int nccl_ofi_rdma_gin_put_comm::send_ack(nccl_ofi_rdma_gin_put_comm &gin_comm, u
 		return -ENOMEM;
 	}
 
-	auto *ack_msg = static_cast<gin_ack_msg_t *>(ack_elem->ptr);
-	*ack_msg = {};
-	ack_msg->msg_type = GIN_MSG_TYPE_ACK;
-	ack_msg->ack_comm_id = static_cast<uint16_t>(peer_comm_id);
-	ack_msg->rx_consumed = rx_consumed & GIN_RX_CONSUMED_MASK;
+	auto *ack_buf = static_cast<gin_ack_msg *>(ack_elem->ptr);
+	*ack_buf = ack_msg;
+	if (endpoint_mr) {
+		ack_buf->src_rank = static_cast<uint64_t>(rank);
+	}
 
 	auto *ofi_ep = ep.get_rail(rail_id).ofi_ep.get();
 
 	nccl_net_ofi_gin_sendack_req_t *req;
 	try {
-		req = gin_comm.get_resources().get_req_from_pool<nccl_net_ofi_gin_sendack_req_t>(
-			gin_comm, ofi_ep, rail_id, ack_elem,
+		req = get_resources().get_req_from_pool<nccl_net_ofi_gin_sendack_req_t>(
+			*this, ofi_ep, rail_id, ack_elem,
 			rank_comm.address[rail_id], ack_fl);
 	} catch (...) {
 		ack_fl->entry_free(ack_elem);
 		throw;
 	}
 
-	NCCL_OFI_TRACE_GIN_ACK_SEND(dev, rail_id, &gin_comm, peer_rank, rx_consumed);
+	NCCL_OFI_TRACE_GIN_ACK_SEND(dev, rail_id, this, peer_rank, ack_msg.rx_consumed);
 
 	int ret = req->post();
 	if (ret == -FI_EAGAIN) {
-		gin_comm.get_resources().add_pending_req(req);
+		get_resources().add_pending_req(req);
 		ret = 0;
 	} else if (ret != 0) {
-		gin_comm.get_resources().return_req_to_pool(req);
+		get_resources().return_req_to_pool(req);
 	}
 
 	return ret;
@@ -349,6 +382,12 @@ int nccl_ofi_rdma_gin_put_comm::regMrSymLocal(nccl_ofi_mr_ckey_ref ckey, void *d
 
 	NCCL_OFI_TRACE(NCCL_NET, "regMrSymDmaBuf ptr %p size %zu type %d handle %p",
 		       data_ptr, size, type, mr_handle);
+	NCCL_OFI_TRACE(NCCL_NET,
+		       "GIN symmetric MR ptr %p size %zu type %d ckey %s "
+		       "base %p len %zu align_off %zu",
+		      data_ptr, size, type, nccl_ofi_mr_ckey_type_str(ckey),
+		      (void *)nccl_ofi_mr_ckey_baseaddr(ckey), (size_t)nccl_ofi_mr_ckey_len(ckey),
+		      (size_t)((uintptr_t)data_ptr % mr_cache_alignment));
 
 	/**
 	 * Local registration with the endpoint
@@ -461,6 +500,18 @@ int nccl_ofi_rdma_gin_put_comm::deregMrSymLocked(nccl_ofi_rdma_gin_symm_mr_handl
 	}
 
 	if (mr_handle->type == NCCL_PTR_CUDA) {
+		/* The gdrcopy worker may still hold queued signal work that points
+		   into the segments released below (a peer's last signals can land
+		   after the window is torn down locally). Let it finish first; this
+		   is the same drain closeColl does before deleting the comm. New
+		   hand-offs cannot start meanwhile: they need ep_lock, which we hold. */
+		while (has_outstanding_gdrcopy()) {
+			if (OFI_UNLIKELY(drain_gdrcopy_done_queue() != 0)) {
+				break;
+			}
+			std::this_thread::yield();
+		}
+
 		/* Release the lazily-pinned segments under the worker's append
 		   lock. Best-effort: log and continue on error, never bail out. */
 		std::lock_guard<std::mutex> seg_lock(signal_segs_mtx);
@@ -521,6 +572,13 @@ int nccl_ofi_rdma_gin_put_comm::await_pending_requests()
 				if (OFI_UNLIKELY(ret != 0)) {
 					return ret;
 				}
+				/* Reap gdrcopy signal completions too: retiring inbound ops
+				   (and hence sending the peer the ACKs it is waiting on)
+				   depends on it, and no proxy thread runs at this point. */
+				ret = drain_gdrcopy_done_queue();
+				if (OFI_UNLIKELY(ret != 0)) {
+					return ret;
+				}
 			}
 		}
 		if (!any_pending) {
@@ -531,27 +589,6 @@ int nccl_ofi_rdma_gin_put_comm::await_pending_requests()
 	}
 
 	return ret;
-}
-
-int nccl_ofi_rdma_gin_put_comm::await_tx_window(nccl_ofi_gin_peer_rank_info &rank_comm)
-{
-	uint32_t outstanding = gin_cursor_delta(rank_comm.tx_head, rank_comm.tx_tail);
-	while (OFI_UNLIKELY(outstanding >= (uint32_t)(GIN_IMM_SEQ_MASK + 1))) {
-		{
-			std::lock_guard<std::mutex> lock(get_ep_lock());
-			int ret = get_resources().progress();
-			if (OFI_UNLIKELY(ret != 0)) {
-				return ret;
-			}
-			ret = drain_gdrcopy_done_queue();
-			if (OFI_UNLIKELY(ret != 0)) {
-				return ret;
-			}
-		}
-		std::this_thread::yield();
-		outstanding = gin_cursor_delta(rank_comm.tx_head, rank_comm.tx_tail);
-	}
-	return 0;
 }
 
 static inline void clear_write_reqs_pending_back_pointers(
@@ -603,39 +640,21 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 
 	auto &gin_ep = get_resources().get_ep();
 	auto &rank_comm = rank_comms[dst_rank];
-	uint16_t msg_seq_num = rank_comm.tx_head & GIN_IMM_SEQ_MASK;
 	uint32_t remote_comm_id = rank_comm.comm_id;
 	auto scheduler = gin_ep.get_scheduler();
 	/* Rail for this op's write(s) and metadata send; assigned in the
 	   size branch below (both size>0 and signal-only paths set it). */
 	uint16_t rail_id;
 
-	/* Wait for a free slot in the TX window if full. */
-	{
-		int ret = await_tx_window(rank_comm);
-		if (OFI_UNLIKELY(ret != 0))
-			return ret;
+	gin_tx_flow_decision flow = {};
+	int ret = flow_policy->prepare_tx(rank_comm, flow, flow_ctx);
+	if (OFI_UNLIKELY(ret != 0)) {
+		return ret;
 	}
 
-	/* Determine if this message needs an ACK.
-	 *
-	 * Same policy for SIGNAL, PUT-SIGNAL, and PUT-only: ask the receiver
-	 * to emit a standalone ACK once the outstanding window is at least
-	 * half full, and only every GIN_ACK_INTERVAL'th op above that
-	 * threshold (hysteresis -- otherwise we'd request an ACK on every op
-	 * once above 50% and flood the receiver with standalone ACKs). Once
-	 * an ACK arrives, tx_tail jumps forward and outstanding drops back
-	 * below the threshold, resetting the gate. */
 	bool has_signal = (signalOp != 0);
-	bool is_ack_requested = false;
-	const uint32_t outstanding = gin_cursor_delta(rank_comm.tx_head, rank_comm.tx_tail);
-
-	if (OFI_UNLIKELY(outstanding >= GIN_ACK_REQ_THRESHOLD)) {
-		if (OFI_UNLIKELY(rank_comm.consecutive_puts_without_ack++ >= GIN_ACK_INTERVAL)) {
-			is_ack_requested = true;
-			rank_comm.consecutive_puts_without_ack = 0;
-		}
-	}
+	bool is_ack_requested = flow.request_ack;
+	uint16_t msg_seq_num = rank_comm.tx_head & GIN_IMM_SEQ_MASK;
 
 	std::lock_guard<std::mutex> scoped_ep_lock(get_ep_lock());
 
@@ -689,7 +708,7 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 	/* Hold write_reqs for error clean up */
 	std::array<nccl_net_ofi_gin_write_req_t *, MAX_NUM_RAILS> write_reqs {};
 
-	int ret = 0;
+	ret = 0;
 
 	NCCL_OFI_TRACE_GIN_IPUT_SIGNAL_BEGIN(dev, size, this, dst_rank, msg_seq_num, req);
 
@@ -742,12 +761,22 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 				xfers[0].rail_id = static_cast<uint16_t>(pinned_rail_id);
 			}
 		}
-		defer = (num_xfers == 1) && aggregate &&
+		/* An op that requests an ACK must ring its doorbell. If it were
+		   deferred and the TX window then filled, the receiver would never
+		   see the request, never ACK, and await_tx_window() would spin
+		   forever (hit at 32 ranks, where the window is small). */
+		defer = !is_ack_requested && (num_xfers == 1) && aggregate &&
 			(pinned_rail_run + 1 < GIN_REQS_PER_DOORBELL);
 
 		nseg += num_xfers;
 		assert_always(nseg > 0);
 		uint64_t data = GIN_IMM_SEG_DATA(remote_comm_id, msg_seq_num, nseg, is_ack_requested);
+		if (endpoint_mr) {
+			/* Remote CQ data on endpoint-MR providers (CXI) carries no source
+			   address; the sender rank rides in the upper 32 bits of the
+			   64-bit CQ data. */
+			data |= static_cast<uint64_t>(this->rank) << 32;
+		}
 
 		/* The metadata send (if any) colocates with the first stripe's rail. */
 		rail_id = xfers[0].rail_id;
@@ -762,8 +791,15 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 			   deferring, to batch with the next op on the pinned rail. A striped
 			   op never defers, so it rings per stripe. */
 			uint64_t wr_flags = FI_REMOTE_CQ_DATA;
-			if ((has_signal && rail_it == 0) || defer)
+			/* On endpoint-MR providers (CXI) pairing the write's doorbell with the
+			   metadata send's costs ~0.8 us of put_signal latency but speeds up
+			   large writes substantially (single-context alltoall, ~+45%), so only
+			   pair for large writes there. */
+			const bool pair_with_send = has_signal && rail_it == 0 &&
+				(!endpoint_mr || xfer_info->msg_size >= GIN_CXI_PAIR_DOORBELL_MIN);
+			if (pair_with_send || defer) {
 				wr_flags |= FI_MORE;
+			}
 
 			auto write_req = get_resources().get_req_from_pool<nccl_net_ofi_gin_write_req_t>(
 				gin_ep.get_rail(rail).ofi_ep.get(),
@@ -806,7 +842,7 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 		rail_id = (pinned_rail_id >= 0)
 			? static_cast<uint16_t>(pinned_rail_id)
 			: get_resources().get_next_rail();
-		defer = aggregate &&
+		defer = !is_ack_requested && aggregate &&
 			(pinned_rail_run + 1 < GIN_REQS_PER_DOORBELL);
 	}
 
@@ -830,6 +866,9 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 		metadata_send->header.seq_num = msg_seq_num;
 		metadata_send->header.seq_seg_cnt = nseg;
 		metadata_send->header.ack_req = is_ack_requested ? 1 : 0;
+		if (endpoint_mr) {
+			metadata_send->header.src_rank = static_cast<uint64_t>(this->rank);
+		}
 		metadata_send->signal_base_address =
 			(sig_mr ? sig_mr->remote_mr[dst_rank].address : 0);
 		metadata_send->signal_offset = signalOff;
@@ -1036,6 +1075,20 @@ static inline uint64_t get_req_map_key(uint32_t peer_rank, uint16_t msg_seq_num)
 	return (static_cast<uint64_t>(peer_rank) << 16) | static_cast<uint64_t>(msg_seq_num);
 }
 
+static inline int gin_flow_progress_tx(nccl_ofi_rdma_gin_put_comm &comm)
+{
+	std::lock_guard<std::mutex> lock(comm.get_ep_lock());
+	int ret = comm.get_resources().progress();
+	if (OFI_UNLIKELY(ret != 0)) {
+		return ret;
+	}
+	ret = comm.drain_gdrcopy_done_queue();
+	if (OFI_UNLIKELY(ret != 0)) {
+		return ret;
+	}
+	return 0;
+}
+
 signal_seg_t *nccl_ofi_rdma_gin_put_comm::find_signal_seg(
 	nccl_ofi_rdma_gin_symm_mr_handle *mr, uintptr_t signal_va)
 {
@@ -1151,6 +1204,25 @@ int nccl_ofi_rdma_gin_put_comm::build_signal_work(
 
 	auto it = this->mr_handle_map.find(signal_base);
 	if (OFI_UNLIKELY(it == this->mr_handle_map.end())) {
+		if (endpoint_mr) {
+			/* A peer's final signals can arrive after this rank has
+			   deregistered the signal window (comm teardown is not
+			   ordered across ranks). Failing here would wedge CQ
+			   processing and with it the peer's ACK wait, so retire
+			   the op normally and sink the increment instead. */
+			static uint64_t late_signal_sink;
+			NCCL_OFI_INFO(NCCL_NET, "Dropping late signal for deregistered base %p",
+				      signal_base);
+			work.signal_base_address = metadata.signal_base_address;
+			work.signal_value = metadata.signal_value;
+			work.type = NCCL_PTR_HOST;
+			work.signal_never_reset = false;
+			work.gdr_handle = nullptr;
+			work.signal_offset = 0;
+			work.host_signal_va = reinterpret_cast<uintptr_t>(&late_signal_sink);
+			work.signal_shadow_slot = nullptr;
+			return 0;
+		}
 		NCCL_OFI_WARN("Signal base address %p not found in MR handle map", signal_base);
 		return -EINVAL;
 	}
@@ -1620,9 +1692,9 @@ int nccl_ofi_rdma_gin_put_comm::iput_signal_recv_req_completion(uint32_t peer_ra
 /* Receiver-side ACK emission. Called from the metadata/write CQ handlers
    after rx_consumed has been advanced by retire_completed_peer_iput_ops.
 
-   Emits a standalone ACK only when the sender explicitly requested one
-   (the ack_req bit was set in either the data immediate or the metadata
-   header for any of this peer's in-flight ops). */
+   Emits a standalone ACK only when the sender requested one. The grant is
+   a fixed worst-case communicator share so the sum of all valid per-peer
+   grants can never outrun the receiver CQ budget as fan-in changes. */
 int nccl_ofi_rdma_gin_put_comm::maybe_send_ack(uint32_t peer_rank, bool sender_requested)
 {
 	if (!sender_requested) {
@@ -1630,7 +1702,9 @@ int nccl_ofi_rdma_gin_put_comm::maybe_send_ack(uint32_t peer_rank, bool sender_r
 	}
 
 	auto &rank_comm = this->rank_comms[peer_rank];
-	int ret = send_ack(*this, peer_rank, rank_comm.rx_consumed);
+	gin_ack_msg ack_msg = {};
+	flow_policy->prepare_ack(rank_comm, rank_comm.rx_consumed, ack_msg);
+	int ret = send_ack(peer_rank, ack_msg);
 	if (OFI_UNLIKELY(ret != 0)) {
 		return ret;
 	}
@@ -1816,7 +1890,14 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
 	uint16_t msg_seq_num = metadata_msg->header.seq_num;
 	uint16_t num_segments = metadata_msg->header.seq_seg_cnt;
 
-	uint32_t peer_rank = get_peer_rank(src_addr, rank_map[rail_id]);
+	const uint64_t peer_rank_value = endpoint_mr ? metadata_msg->header.src_rank
+						     : get_peer_rank(src_addr, rank_map[rail_id]);
+	if (OFI_UNLIKELY(!gin_peer_rank_is_valid(peer_rank_value, nranks))) {
+		NCCL_OFI_WARN("Invalid GIN metadata source rank %llu (nranks=%d) on rail %u",
+			      static_cast<unsigned long long>(peer_rank_value), nranks, rail_id);
+		return -EINVAL;
+	}
+	const uint32_t peer_rank = static_cast<uint32_t>(peer_rank_value);
 
 	NCCL_OFI_TRACE_GIN_HANDLE_SIGNAL_METADATA_COMPLETION_FUNC_START(
 		dev, this, rail_id, peer_rank, msg_seq_num, num_segments);
@@ -1858,10 +1939,17 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
 	return ret;
 }
 
-int nccl_ofi_rdma_gin_put_comm::handle_ack_completion(const gin_ack_msg_t *ack_msg,
+int nccl_ofi_rdma_gin_put_comm::handle_ack_completion(const gin_ack_msg *ack_msg,
 						      fi_addr_t src_addr, uint16_t rail_id)
 {
-	uint32_t peer_rank = get_peer_rank(src_addr, rank_map[rail_id]);
+	const uint64_t peer_rank_value = endpoint_mr ? ack_msg->src_rank
+						     : get_peer_rank(src_addr, rank_map[rail_id]);
+	if (OFI_UNLIKELY(!gin_peer_rank_is_valid(peer_rank_value, nranks))) {
+		NCCL_OFI_WARN("Invalid GIN ACK source rank %llu (nranks=%d) on rail %u",
+			      static_cast<unsigned long long>(peer_rank_value), nranks, rail_id);
+		return -EINVAL;
+	}
+	const uint32_t peer_rank = static_cast<uint32_t>(peer_rank_value);
 	uint32_t rx_consumed = ack_msg->rx_consumed;
 
 	NCCL_OFI_TRACE_GIN_HANDLE_ACK_COMPLETION_FUNC_START(dev, this, rail_id, peer_rank, rx_consumed);
@@ -1873,14 +1961,7 @@ int nccl_ofi_rdma_gin_put_comm::handle_ack_completion(const gin_ack_msg_t *ack_m
 	   arriving after newer ones are no-ops because they don't move
 	   tx_tail forward. */
 	apply_rx_consumed(peer_rank, rx_consumed);
-	auto &rank_comm = rank_comms[peer_rank];
-	if (rank_comm.has_pending_ack_request) {
-		uint32_t delta = gin_cursor_delta(rx_consumed,
-						  rank_comm.last_ack_requested_seq);
-		if (delta <= GIN_RX_CONSUMED_HALF) {
-			rank_comm.has_pending_ack_request = false;
-		}
-	}
+	flow_policy->process_ack(rank_comms[peer_rank], *ack_msg);
 
 	NCCL_OFI_TRACE_GIN_HANDLE_ACK_COMPLETION_FUNC_END(dev, this, rail_id, peer_rank,
 						  rx_consumed, 0);
@@ -1895,7 +1976,14 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_write_completion(struct fi_cq_data
 	uint16_t msg_seq_num = GIN_IMM_GET_SEQ_NUM(cq_entry->data);
 	bool is_ack_requested = GIN_IMM_GET_ACK_REQUESTED(cq_entry->data);
 
-	uint32_t peer_rank = get_peer_rank(src_addr, rank_map[rail_id]);
+	const uint64_t peer_rank_value = endpoint_mr ? (cq_entry->data >> 32)
+						     : get_peer_rank(src_addr, rank_map[rail_id]);
+	if (OFI_UNLIKELY(!gin_peer_rank_is_valid(peer_rank_value, nranks))) {
+		NCCL_OFI_WARN("Invalid GIN write source rank %llu (nranks=%d) on rail %u",
+			      static_cast<unsigned long long>(peer_rank_value), nranks, rail_id);
+		return -EINVAL;
+	}
+	const uint32_t peer_rank = static_cast<uint32_t>(peer_rank_value);
 
 	NCCL_OFI_TRACE_GIN_HANDLE_SIGNAL_WRITE_COMPLETION_FUNC_START(dev, this, rail_id, peer_rank,
 								     msg_seq_num, total_segms,

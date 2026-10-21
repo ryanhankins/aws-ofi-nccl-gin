@@ -1,0 +1,58 @@
+From df194c9322b1627213fcad5e11f3824a9a507a81 Mon Sep 17 00:00:00 2001
+From: Jeff Hammond <jehammond@nvidia.com>
+Date: Fri, 16 Oct 2026 09:53:52 +0200
+Subject: [PATCH] m2n tests: wait for async comm init in
+ PipeGraphPathTest::initComm
+
+With NCCL_COMM_BLOCKING=0 the test used the communicator before ncclCommInitRank
+finished, failing with 'Attempt to use communicator before the previous operation
+returned ncclSuccess'. Wait for readiness after init and before destroy.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ nccl_m2n/tests/pipe_graph_path_test.cc | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/nccl_m2n/tests/pipe_graph_path_test.cc b/nccl_m2n/tests/pipe_graph_path_test.cc
+index a487017..3330726 100644
+--- a/nccl_m2n/tests/pipe_graph_path_test.cc
++++ b/nccl_m2n/tests/pipe_graph_path_test.cc
+@@ -171,7 +171,10 @@ protected:
+     if (rank_ == 0) ASSERT_EQ(ncclSuccess, ncclGetUniqueId(&id));
+     ASSERT_EQ(MPI_SUCCESS, MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD));
+ 
+-    ASSERT_EQ(ncclSuccess, ncclCommInitRank(comm, world_, id, rank_));
++    const ncclResult_t initResult = ncclCommInitRank(comm, world_, id, rank_);
++    ASSERT_TRUE(initResult == ncclSuccess || initResult == ncclInProgress);
++    // NCCL_COMM_BLOCKING=0 makes init asynchronous: wait before using the communicator.
++    ASSERT_EQ(ncclSuccess, m2nWaitCommReady(*comm));
+   }
+ 
+   void preparePipeParams(ncclComm_t comm, const size_t (&tensorDims)[2], ncclDistTensor_t* src,
+@@ -290,6 +293,7 @@ TEST_F(PipeGraphPathTest, Dsv3LikeFourSourceShardsTwoLocalDestinationReplicas) {
+ 
+   gReshardCopyAlgorithm = savedCopyAlgorithm;
+   ASSERT_EQ(MPI_SUCCESS, MPI_Barrier(MPI_COMM_WORLD));
++  ASSERT_EQ(ncclSuccess, ncclCommFinalize(comm) == ncclInProgress ? m2nWaitCommReady(comm) : ncclSuccess);
+   ASSERT_EQ(ncclSuccess, ncclCommDestroy(comm));
+ }
+ 
+@@ -404,6 +408,7 @@ TEST_F(PipeGraphPathTest, FourRanksCoverPointToPointTrainerFaninAndTrainerFanout
+ 
+   gReshardCopyAlgorithm = savedCopyAlgorithm;
+   ASSERT_EQ(MPI_SUCCESS, MPI_Barrier(MPI_COMM_WORLD));
++  ASSERT_EQ(ncclSuccess, ncclCommFinalize(comm) == ncclInProgress ? m2nWaitCommReady(comm) : ncclSuccess);
+   ASSERT_EQ(ncclSuccess, ncclCommDestroy(comm));
+ }
+ 
+@@ -481,6 +486,7 @@ TEST_F(PipeGraphPathTest, ThreeDestinationDomainsCoverGeneratorRingIngressForwar
+ 
+   gReshardCopyAlgorithm = savedCopyAlgorithm;
+   ASSERT_EQ(MPI_SUCCESS, MPI_Barrier(MPI_COMM_WORLD));
++  ASSERT_EQ(ncclSuccess, ncclCommFinalize(comm) == ncclInProgress ? m2nWaitCommReady(comm) : ncclSuccess);
+   ASSERT_EQ(ncclSuccess, ncclCommDestroy(comm));
+ }
+ 
+-- 
+2.55.0
+
