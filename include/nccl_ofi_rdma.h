@@ -574,7 +574,7 @@ public:
     int write(void* src, size_t size, void* src_mhandle, uint64_t dest, uint64_t mr_key, nccl_net_ofi_req **req) override;
     int write_inline(void* src, size_t size, uint64_t dest, uint64_t mr_key, nccl_net_ofi_req **request) override;
 
-    nccl_net_ofi_rdma_ep_t *get_ep();
+    nccl_net_ofi_rdma_ep_t *get_ep() const;
     nccl_net_ofi_rdma_send_comm_rail_t *get_data_rail(uint16_t rail_id);
     bool drain_sender_eager_queue();
 
@@ -795,7 +795,7 @@ public:
     int close() override;
     int read(void* dest, size_t size, void* dest_mhandle, uint64_t src, uint64_t mr_key, nccl_net_ofi_req **req) override;
 
-    nccl_net_ofi_rdma_ep_t *get_ep();
+    nccl_net_ofi_rdma_ep_t *get_ep() const;
     nccl_net_ofi_rdma_recv_comm_rail_t *get_data_rail(uint16_t rail_id);
     nccl_net_ofi_rdma_recv_comm_rail_t *get_control_rail(uint16_t rail_id);
     int allocate_recv_req(nccl_net_ofi_rdma_device_t *device,
@@ -1243,12 +1243,12 @@ public:
 		return domain_rails[rail_id].domain;
 	}
 
-	inline uint16_t get_ofi_num_rails() override
+	inline uint16_t get_ofi_num_rails() const override
 	{
 		return num_rails;
 	}
 
-	inline nccl_net_ofi_rdma_device_t *rdma_domain_get_device();
+	inline nccl_net_ofi_rdma_device_t *rdma_domain_get_device() const;
 
 	inline nccl_net_ofi_rdma_domain_rail_t *rdma_domain_get_rail(uint16_t rail_id)
 	{
@@ -1366,29 +1366,6 @@ private:
 			     int type,
 			     nccl_net_ofi_rdma_ep_t *ep,
 			     nccl_net_ofi_rdma_mr_handle_t **mhandle);
-
-	/**
-	 * @brief	Bind and enable a memory region on an endpoint
-	 *
-	 * Calls fi_mr_bind followed by fi_mr_enable on the given MR and endpoint.
-	 *
-	 * @param	mr
-	 *		The memory region to bind and enable
-	 * @param	ofi_ep
-	 *		The endpoint to bind the MR to
-	 * @param	rail_id
-	 *		Rail index, used only for diagnostic messages
-	 * @param	rail_type
-	 *		Human-readable rail type string (e.g. "data" or "ctrl"),
-	 *		used only for diagnostic messages
-	 *
-	 * @return	0 on success
-	 *		non-zero on error
-	 */
-	int mr_bind_and_enable(struct fid_mr *mr,
-			       struct fid_ep *ofi_ep,
-			       uint16_t rail_id,
-			       const char *rail_type);
 
 	/**
 	 * @brief	Deregister memory region without acquiring memory region cache lock
@@ -1550,12 +1527,12 @@ public:
 	/* Returns a raw pointer for downcasting to the transport-specific
 	 * domain type. Safe because the ep holds shared_ptr<domain>,
 	 * so the domain is alive as long as the ep exists. */
-	inline nccl_net_ofi_rdma_domain_t *rdma_endpoint_get_domain()
+	inline nccl_net_ofi_rdma_domain_t *rdma_endpoint_get_domain() const
 	{
 		return static_cast<nccl_net_ofi_rdma_domain_t *>(domain.get());
 	}
 
-	inline nccl_net_ofi_rdma_device_t *rdma_endpoint_get_device()
+	inline nccl_net_ofi_rdma_device_t *rdma_endpoint_get_device() const
 	{
 		return rdma_endpoint_get_domain()->rdma_domain_get_device();
 	}
@@ -1917,7 +1894,7 @@ public:
 				   struct fi_info *info_list,
 				   const nccl_ofi_topo_t *topo);
 
-	int get_properties(nccl_ofi_properties_t *props) override;
+	int get_properties(nccl_ofi_properties_t *props) const override;
 
 	inline struct fi_info *get_ofi_info_for_cm() const override
 	{
@@ -2073,7 +2050,7 @@ int nccl_net_ofi_rdma_init(const char *provider_filter,
 			   bool *found_multi_rail,
 			   nccl_ofi_topo_t *topo);
 
-inline nccl_net_ofi_rdma_device_t *nccl_net_ofi_rdma_domain_t::rdma_domain_get_device()
+inline nccl_net_ofi_rdma_device_t *nccl_net_ofi_rdma_domain_t::rdma_domain_get_device() const
 {
 	return static_cast<nccl_net_ofi_rdma_device_t *>(device);
 }

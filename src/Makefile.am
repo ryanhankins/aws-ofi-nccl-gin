@@ -55,6 +55,8 @@ sources += \
 	rdma/gin/nccl_ofi_gin.cpp \
 	rdma/gin/nccl_ofi_gin_allgather.cpp \
 	rdma/gin/nccl_ofi_gin_api.cpp \
+	rdma/gin/nccl_ofi_gin_flow_posted_recv.cpp \
+	rdma/gin/nccl_ofi_gin_flow_writedata_routed.cpp \
 	rdma/gin/nccl_ofi_gin_reqs.cpp \
 	rdma/gin/nccl_ofi_gin_resources.cpp
 if HAVE_GDAKI

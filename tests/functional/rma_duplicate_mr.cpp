@@ -140,8 +140,11 @@ int main(int argc, char *argv[])
 	 * Both calls should succeed and return the same handle.
 	 */
 	constexpr uint64_t mrFlags = 0;
-	void *buff = nullptr;
-	OFINCCLCHECK(allocate_buff(&buff, SEND_SIZE, buffer_type));
+	/* Exercise registration-relative addressing with distinct, unaligned peer buffers. */
+	const size_t buffer_offset = sizeof(uint64_t) * (1 + rank % 16);
+	void *allocation = nullptr;
+	OFINCCLCHECK(allocate_buff(&allocation, SEND_SIZE + buffer_offset, buffer_type));
+	void *buff = static_cast<uint8_t *>(allocation) + buffer_offset;
 	OFINCCLCHECK(initialize_buff(buff, SEND_SIZE, buffer_type, 0));
 
 	void *mhandle1 = nullptr;
@@ -339,7 +342,7 @@ int main(int argc, char *argv[])
 	MPI_Barrier(MPI_COMM_WORLD);
 	MPI_Finalize();
 
-	OFINCCLCHECK(deallocate_buffer(buff, buffer_type));
+	OFINCCLCHECK(deallocate_buffer(allocation, buffer_type));
 
 	NCCL_OFI_INFO(NCCL_NET, "Test completed successfully for rank %d", rank);
 

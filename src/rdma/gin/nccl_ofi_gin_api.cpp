@@ -6,7 +6,8 @@
 
 #include <atomic>
 #include <cstring>
-#include <thread>
+#include <mutex>
+#include <vector>
 
 #include "rdma/gin/nccl_ofi_gin.h"
 #include "rdma/gin/nccl_ofi_gin_api.h"
@@ -51,17 +52,15 @@ ncclResult_t nccl_ofi_gin_init(void **ctx, uint64_t commId, ncclDebugLogger_t lo
 		return ncclInternalError;
 	}
 
-	/* We make the global MR assumption in various places. */
-	if (endpoint_mr) {
-		NCCL_OFI_WARN("GIN plugin does not support FI_MR_ENDPOINT");
-		return ncclInternalError;
-	}
+	/* Providers that require FI_MR_ENDPOINT (e.g. CXI) have each MR bound to
+	   the GIN endpoint of the rail it was registered on; see
+	   nccl_ofi_rdma_gin_ep_t::reg_mr. */
 
 	/* GDR copy context is now a singleton, lazily initialized on first use.
 	 * GIN requires GDRCopy 2.5+ for forced PCIe copy support. */
 	try {
 		nccl_ofi_device_copy &gdr = get_device_copy();
-		if (!gdr.forced_pcie_copy()) {
+		if (!gdr.supports_forced_pcie_copy()) {
 			NCCL_OFI_WARN("GIN requires GDRCopy 2.5+ for forced PCIe copy support");
 			return ncclInternalError;
 		}
@@ -143,20 +142,13 @@ ncclResult_t nccl_ofi_gin_listen(void *ctx, int dev, void *handle, void **listen
 		return ncclInternalError;
 	}
 
-	/* Bucket connections across endpoints by their owning GIN progress
-	   thread, so each progress thread drives its own endpoint instead of
-	   contending on a shared completion queue.
-
-	   NCCL calls listen() ginCommCount times (once per collComm).
-	   listen_seq % NCCL_GIN_PROXY_NTHREADS maps each connection to its
-	   owning thread's endpoint:
-	   - When ginCommCount == NTHREADS (typical): each listen gets a unique
-	     thread_idx, yielding one dedicated EP per thread.
-	   - When ginCommCount > NTHREADS: multiple connections share an EP
-	     (thread t round-robins connections t, t+T, t+2T, ... and they all
-	     land on the same endpoint_key).
-	   - NCCL_GIN_PROXY_NTHREADS=1 (default): all connections share the
-	     single per-init seq endpoint (legacy behavior). */
+	/* Keep plugin endpoint bucketing aligned with NCCL's proxy ownership:
+	   nccl/src/gin/gin_host.cc drives commIdx t, t+proxyNthreads, ... on
+	   proxy thread t, and listen() is called once per commIdx in that same
+	   sequence. Because both sides key off NCCL_GIN_PROXY_NTHREADS, this
+	   listen_seq % nthreads bucket must stay in lock-step with NCCL's
+	   commIdx % proxyNthreads partitioning or shared-endpoint flow-control
+	   state will corrupt silently. */
 	const int listen_seq = context->listen_count++;
 	int thread_idx = listen_seq % context->nthreads;
 
@@ -202,7 +194,8 @@ ncclResult_t nccl_ofi_gin_listen(void *ctx, int dev, void *handle, void **listen
 }
 
 ncclResult_t nccl_ofi_gin_connect(void *ctx, void *handles[], int nranks, int rank,
-					 void *listenComm, void **collComm)
+				  void *listenComm, void **collComm,
+				  volatile uint32_t *abortFlag)
 {
 	auto *gin_handles = reinterpret_cast<nccl_net_ofi_conn_handle_t **>(handles);
 	auto *gin_l_comm = static_cast<nccl_ofi_rdma_gin_listen_comm *>(listenComm);
@@ -211,13 +204,21 @@ ncclResult_t nccl_ofi_gin_connect(void *ctx, void *handles[], int nranks, int ra
 
 	try {
 		ret = gin_l_comm->connect(gin_handles, nranks, rank,
-					  reinterpret_cast<nccl_ofi_gin_put_comm_t **>(collComm));
+					  reinterpret_cast<nccl_ofi_gin_put_comm_t **>(collComm),
+					  nccl_ofi_gin_abort_token(abortFlag));
 	} catch (const std::exception &e) {
 		NCCL_OFI_WARN("Caught exception in GIN connect: %s", e.what());
 		ret = -EINVAL;
 	}
 
 	return nccl_net_ofi_retval_translate(ret);
+}
+
+ncclResult_t nccl_ofi_gin_connect_v14(void *ctx, void *handles[], int nranks, int rank,
+				      void *listenComm, void **collComm)
+{
+	/* The pre-v15 op tables have no abort flag, so this never aborts. */
+	return nccl_ofi_gin_connect(ctx, handles, nranks, rank, listenComm, collComm, nullptr);
 }
 
 ncclResult_t nccl_ofi_gin_make_ckey(void *data, size_t size, uint64_t offset, int fd,
@@ -301,6 +302,19 @@ ncclResult_t nccl_ofi_gin_closeColl(void *collComm)
 	int ret = gin_comm->await_pending_requests();
 	if (OFI_UNLIKELY(ret != 0)) {
 		return nccl_net_ofi_retval_translate(ret);
+	}
+
+	if (endpoint_mr) {
+		/* Proxy threads have stopped. Keep progressing until every peer has
+		   drained its ACK requests, including ranks with no requests of their own. */
+		std::vector<char> arrived(gin_comm->get_nranks(), 0);
+		ret = gin_comm->get_ag_comm().all_gather(arrived.data(), 1, [&]() {
+			std::lock_guard<std::mutex> lock(gin_comm->get_ep_lock());
+			return gin_comm->get_resources().progress();
+		});
+		if (OFI_UNLIKELY(ret != 0)) {
+			return nccl_net_ofi_retval_translate(ret);
+		}
 	}
 
 	/* Phase 1 — quiesce the shared gdrcopy worker for this comm. The worker
@@ -576,7 +590,7 @@ NCCL_OFI_EXPORT_SYMBOL ncclGin_v11_t ncclGinPlugin_v11 = {
 	.devices = nccl_ofi_gin_devices,
 	.getProperties = nccl_ofi_gin_getProperties,
 	.listen = nccl_ofi_gin_listen,
-	.connect = nccl_ofi_gin_connect,
+	.connect = nccl_ofi_gin_connect_v14,
 	/* createContext is only relevant for GDAKI, not proxy mode */
 	.createContext = nullptr,
 	.regMrSym = nccl_ofi_gin_regMrSym,
@@ -602,7 +616,7 @@ NCCL_OFI_EXPORT_SYMBOL ncclGin_v13_t ncclGinPlugin_v13 = {
 	.devices = nccl_ofi_gin_devices,
 	.getProperties = nccl_ofi_gin_getProperties_v13,
 	.listen = nccl_ofi_gin_listen,
-	.connect = nccl_ofi_gin_connect,
+	.connect = nccl_ofi_gin_connect_v14,
 	.createContext = nccl_ofi_gin_createContext_v13,
 	.regMrSym = nccl_ofi_gin_regMrSym,
 	.regMrSymDmaBuf = nccl_ofi_gin_regMrSymDmaBuf,
@@ -673,7 +687,7 @@ NCCL_OFI_EXPORT_SYMBOL ncclRma_v14_t ncclRmaPlugin_v14 = {
 	.devices = nccl_ofi_gin_devices,
 	.getProperties = nccl_ofi_gin_getProperties_v13,
 	.listen = nccl_ofi_gin_listen,
-	.connect = nccl_ofi_gin_connect,
+	.connect = nccl_ofi_gin_connect_v14,
 	.createContext = nccl_ofi_rma_createContext_v14,
 	.regMrSym = nccl_ofi_rma_regMrSym_v14,
 	.regMrSymDmaBuf = nccl_ofi_rma_regMrSymDmaBuf_v14,
@@ -739,7 +753,45 @@ NCCL_OFI_EXPORT_SYMBOL ncclRma_v15_t ncclRmaPlugin_v15 = {
 	.devices = nccl_ofi_gin_devices,
 	.getProperties = nccl_ofi_gin_getProperties_v13,
 	.listen = nccl_ofi_gin_listen,
-	.connect = nccl_ofi_gin_connect,
+	.connect = nccl_ofi_gin_connect_v14,
+	.createContext = nccl_ofi_rma_createContext_v14,
+	.regMrSym = nccl_ofi_rma_regMrSym_v14,
+	.regMrSymDmaBuf = nccl_ofi_rma_regMrSymDmaBuf_v14,
+	.deregMrSym = nccl_ofi_gin_deregMrSym,
+	.destroyContext = nccl_ofi_gin_destroyContext_v13,
+	.closeColl = nccl_ofi_gin_closeColl,
+	.closeListen = nccl_ofi_gin_closeListen,
+	.iput = nccl_ofi_rma_iput_v15,
+	.iputSignal = nccl_ofi_rma_iputSignal_v15,
+	.iget = nccl_ofi_rma_iget_v15,
+	.iflush = nccl_ofi_gin_iflush_v13,
+	.test = nccl_ofi_gin_test,
+	.rmaProgress = nccl_ofi_gin_ginProgress,
+	.queryLastError = nullptr,
+	.finalize = nccl_ofi_gin_finalize
+};
+
+/* Our signals are per-peer: a signal only means that sender's own data has
+ * landed, not that other peers' writes are done. So flushesAllPutsOnAnySignal
+ * is false. */
+static ncclResult_t nccl_ofi_rma_getRmaProperties_v16(void *collComm,
+						      ncclRmaProperties_v16_t *rmaProps)
+{
+	(void)collComm;
+	rmaProps->flushesAllPutsOnAnySignal = false;
+	return ncclSuccess;
+}
+
+/* RMA v16 op-table. v16 only adds getRmaProperties over v15, so every other
+ * entry reuses the v15/v14 wrappers unchanged. */
+NCCL_OFI_EXPORT_SYMBOL ncclRma_v16_t ncclRmaPlugin_v16 = {
+	.name = "Libfabric",
+	.init = nccl_ofi_gin_init,
+	.devices = nccl_ofi_gin_devices,
+	.getRmaProperties = nccl_ofi_rma_getRmaProperties_v16,
+	.getProperties = nccl_ofi_gin_getProperties_v13,
+	.listen = nccl_ofi_gin_listen,
+	.connect = nccl_ofi_gin_connect_v14,
 	.createContext = nccl_ofi_rma_createContext_v14,
 	.regMrSym = nccl_ofi_rma_regMrSym_v14,
 	.regMrSymDmaBuf = nccl_ofi_rma_regMrSymDmaBuf_v14,

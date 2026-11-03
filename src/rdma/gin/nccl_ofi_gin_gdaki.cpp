@@ -171,6 +171,27 @@ static ncclResult_t nccl_ofi_gin_gdaki_get_properties(int dev, ncclNetProperties
  *
  * Throws std::runtime_error on fi_getname / allgather failure.
  */
+/**
+ * Run one of createContext's setup allgathers.
+ *
+ * createContext performs 1 + 2*effective_rails + nContexts of these in series,
+ * every one of which waits on all peers, so each is a place the job can hang if
+ * a peer dies. all_gather() polls the communicator's abort token and returns
+ * -ECANCELED when it fires; say so in the message, since the application is the
+ * one that aborted and only the log needs to tell the two apart.
+ */
+static void gdaki_setup_allgather(nccl_ofi_rdma_gin_put_comm *put_comm, void *data, size_t size,
+				  const std::string &what)
+{
+	int ret = put_comm->get_ag_comm().all_gather(data, size);
+	if (OFI_UNLIKELY(ret == -ECANCELED)) {
+		throw std::runtime_error("communicator aborted during " + what);
+	}
+	if (OFI_UNLIKELY(ret != 0)) {
+		throw std::runtime_error(what + " failed: " + std::to_string(ret));
+	}
+}
+
 static std::vector<uint8_t> allgather_ep_addrs_batched(
 	const std::vector<struct fid_ep *> &eps,
 	nccl_ofi_rdma_gin_put_comm *put_comm,
@@ -193,9 +214,7 @@ static std::vector<uint8_t> allgather_ep_addrs_batched(
 		}
 	}
 
-	if (put_comm->get_ag_comm().all_gather(all.data(), rec_len) != 0) {
-		throw std::runtime_error("batched allgather of ep addresses failed");
-	}
+	gdaki_setup_allgather(put_comm, all.data(), rec_len, "batched allgather of ep addresses");
 	return all;
 }
 
@@ -219,9 +238,8 @@ static void exchange_signal_counter_counts(nccl_ofi_gin_gdaki_context *ctx,
 	std::vector<int32_t> counts(nranks * 2, 0);
 	counts[rank * 2 + 0] = ctx->nSignals;
 	counts[rank * 2 + 1] = ctx->nCounters;
-	if (put_comm->get_ag_comm().all_gather(counts.data(), 2 * sizeof(int32_t)) != 0) {
-		throw std::runtime_error("allgather of signal/counter counts failed");
-	}
+	gdaki_setup_allgather(put_comm, counts.data(), 2 * sizeof(int32_t),
+			      "allgather of signal/counter counts");
 
 	ctx->global_n_sc = 0;
 	for (int p = 0; p < nranks; p++) {
@@ -289,16 +307,10 @@ static void setup_scratch_buffer(nccl_ofi_gin_gdaki_context *ctx,
 		scratch_all_addrs[rank] = ctx->scratch_local_addr;
 		scratch_all_rkeys[rank] = rs.scratch_lkey;
 
-		if (put_comm->get_ag_comm().all_gather(
-			    scratch_all_addrs.data(), sizeof(uint64_t)) != 0) {
-			throw std::runtime_error("scratch allgather addrs (rail " +
-						 std::to_string(r) + ") failed");
-		}
-		if (put_comm->get_ag_comm().all_gather(
-			    scratch_all_rkeys.data(), sizeof(uint32_t)) != 0) {
-			throw std::runtime_error("scratch allgather rkeys (rail " +
-						 std::to_string(r) + ") failed");
-		}
+		gdaki_setup_allgather(put_comm, scratch_all_addrs.data(), sizeof(uint64_t),
+				      "scratch allgather addrs (rail " + std::to_string(r) + ")");
+		gdaki_setup_allgather(put_comm, scratch_all_rkeys.data(), sizeof(uint32_t),
+				      "scratch allgather rkeys (rail " + std::to_string(r) + ")");
 
 		rs.scratch_remote_addrs_buf.allocate(nranks);
 		rs.scratch_remote_rkeys_buf.allocate(nranks);
@@ -745,8 +757,21 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		 * with fewer than global_n_sc sc EPs leaves the surplus slots
 		 * as nullptr (zero address). This is also the target-slot layout
 		 * of each poster's target addressing table. */
+		/* Thread this through for consistency with the writedata-routed CQ sizing
+		 * work; GDAKI windowing does not consult it today, so this is a
+		 * behavior no-op on this path. */
+		const size_t configured_rx_cq_size = ofi_nccl_cq_size();
 		const size_t total_slots = 1 + (size_t)global_n_sc;
 		for (int ctx_id = 0; ctx_id < nContexts; ctx_id++) {
+			/* One allgather per context runs below, so check between
+			 * contexts as well: an abort raised while an earlier
+			 * context was being built should not open the rest. */
+			if (OFI_UNLIKELY(put_comm->get_abort_token().requested())) {
+				throw std::runtime_error("communicator aborted during context " +
+							 std::to_string(ctx_id) +
+							 " endpoint setup");
+			}
+
 			/* This context's endpoints open on rail
 			 * (ctx_id % num_rails)'s domain. Distinct contextIds
 			 * therefore spread across the GPU's NICs. */
@@ -765,11 +790,9 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			/* The data endpoint issues both Put and Get, so it counts reads too. */
 			/* Put and Get carry their payload through the SGE, so the data
 			 * endpoint keeps the 64B entry and the full SQ depth. */
-			ctx->data[ctx_id]->open(ofi_domain,
-						proxy_info,
-						gda_ops,
-						FI_WRITE | FI_READ,
-						/* inline_write_size */ 0);
+			ctx->data[ctx_id]->open(ofi_domain, proxy_info, gda_ops,
+				       FI_WRITE | FI_READ, configured_rx_cq_size,
+				       /* inline_write_size */ 0);
 			if (local_n_sc > 0) {
 				ctx->sc_endpoints[ctx_id].reserve(local_n_sc);
 			}
@@ -778,7 +801,9 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 				/* Slot i serves as counter i while i < nCounters and as
 				 * signal i while i < nSignals, so it takes a counter for
 				 * each role it fills. */
-				ctx->sc_endpoints[ctx_id][i]->open(ofi_domain, proxy_info, gda_ops,
+				ctx->sc_endpoints[ctx_id][i]->open(ofi_domain, proxy_info,
+								   gda_ops,
+								   configured_rx_cq_size,
 								   i < config->nCounters,
 								   i < config->nSignals);
 			}
@@ -787,8 +812,8 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			/* Backend version 2 and later carry up to eight bytes as WQE
 			 * inline data, so their PutValue endpoint takes the wide entry
 			 * (at half SQ depth). Backend version 1 keeps the narrow entry. */
-			ctx->pvdata[ctx_id]->open(
-				ofi_domain, proxy_info, gda_ops, FI_WRITE, putvalue_inline_size);
+			ctx->pvdata[ctx_id]->open(ofi_domain, proxy_info, gda_ops, FI_WRITE,
+				       configured_rx_cq_size, putvalue_inline_size);
 
 			/*
 			 * Step 5: Exchange ALL of this ctx's endpoint addresses in a
@@ -1265,8 +1290,81 @@ NCCL_OFI_EXPORT_SYMBOL ncclGin_v14_t ncclGinPlugin_v14 = {
 	.getGinProperties = nccl_ofi_gin_gdaki_getGinProperties_v14,
 	.getProperties = nccl_ofi_gin_gdaki_get_properties,
 	.listen = nccl_ofi_gin_listen,
-	.connect = nccl_ofi_gin_connect,
+	.connect = nccl_ofi_gin_connect_v14,
 	.createContext = nccl_ofi_gin_gdaki_createContext_v14,
+	.regMrSym = nccl_ofi_gin_gdaki_regMrSym,
+	.regMrSymDmaBuf = nccl_ofi_gin_regMrSymDmaBuf,
+	.deregMrSym = nccl_ofi_gin_gdaki_deregMrSym,
+	.destroyContext = nccl_ofi_gin_gdaki_destroyContext,
+	.closeColl = nccl_ofi_gin_gdaki_closeColl,
+	.closeListen = nccl_ofi_gin_closeListen,
+	.ginProgress = nccl_ofi_gin_ginProgress,
+	.queryLastError = nccl_ofi_gin_gdaki_queryLastError,
+	.finalize = nccl_ofi_gin_finalize
+};
+
+/* v15 GIN op-table. Three things changed from v14:
+ *   - ncclGinProperties gains barrierOptions, the barrier algorithm the backend
+ *     wants NCCL to run;
+ *   - connect() takes an abortFlag, which this backend stores on the put_comm
+ *     so every setup collective it owns can be interrupted;
+ *   - ncclGinConfig replaces rankStride with peerArray/peerArrayCount, which
+ *     this backend does not act on yet (it addresses every peer).
+ * NCCL probes the tables in the order v15, v14, v13 and uses the first it
+ * finds, so this one supersedes ncclGinPlugin_v14 above on NCCL 2.32.4+.
+ */
+
+static ncclResult_t nccl_ofi_gin_gdaki_getGinProperties_v15(ncclGinProperties_v15_t *ginProps)
+{
+	ginProps->supportsStrongSignals = false;
+	ginProps->supportsVASignals = false;
+	/* EFA completion counters are a fixed per-NIC resource (fi_info reports
+	 * cntr_cnt), and the default barrier spends one signal per peer per
+	 * barrier, so the per-context request grows with both the team size and
+	 * the barrier count until fi_enable() returns ENOMEM. Ask instead for the
+	 * barrier that spends two signals whatever the team size. This has to
+	 * agree with ncclGinApi_BarrierOptions<NCCL_NET_DEVICE_GIN_EFA_GDA> in
+	 * NCCL's device code, which already returns SIGNAL_EFFICIENT: NCCL sizes
+	 * the signals from what is reported here, while the kernel strides them by
+	 * what its device specialization returns. */
+	ginProps->barrierOptions = NCCL_GIN_BARRIER_SIGNAL_EFFICIENT;
+	return ncclSuccess;
+}
+
+static ncclResult_t nccl_ofi_gin_gdaki_createContext_v15(void *collComm, ncclGinConfig_v15_t *config,
+							 void **ginCtx,
+							 ncclNetDeviceHandle_v11_t **devHandle)
+{
+	if (config == nullptr) {
+		NCCL_OFI_WARN("gin GDAKI: createContext_v15 received NULL config");
+		return ncclInvalidArgument;
+	}
+
+	/* Every field this backend acts on is shared with v14, so hand it the v14
+	 * config and let it do the backendVersion check in one place. peerArray /
+	 * peerArrayCount name the peers NCCL wants connected; GDAKI connects the
+	 * whole communicator and so does not act on them, exactly as it did not
+	 * act on the rankStride they replace. */
+	ncclGinConfig_v14_t config_v14;
+	memset(&config_v14, 0, sizeof(config_v14));
+	config_v14.nSignals = config->nSignals;
+	config_v14.nCounters = config->nCounters;
+	config_v14.nContexts = config->nContexts;
+	config_v14.queueDepth = config->queueDepth;
+	config_v14.trafficClass = config->trafficClass;
+	config_v14.backendVersion = config->backendVersion;
+	return nccl_ofi_gin_gdaki_createContext_v14(collComm, &config_v14, ginCtx, devHandle);
+}
+
+NCCL_OFI_EXPORT_SYMBOL ncclGin_v15_t ncclGinPlugin_v15 = {
+	.name = "Libfabric_GDAKI",
+	.init = nccl_ofi_gin_init,
+	.devices = nccl_ofi_gin_devices,
+	.getGinProperties = nccl_ofi_gin_gdaki_getGinProperties_v15,
+	.getProperties = nccl_ofi_gin_gdaki_get_properties,
+	.listen = nccl_ofi_gin_listen,
+	.connect = nccl_ofi_gin_connect,
+	.createContext = nccl_ofi_gin_gdaki_createContext_v15,
 	.regMrSym = nccl_ofi_gin_gdaki_regMrSym,
 	.regMrSymDmaBuf = nccl_ofi_gin_regMrSymDmaBuf,
 	.deregMrSym = nccl_ofi_gin_gdaki_deregMrSym,

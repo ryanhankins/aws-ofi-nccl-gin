@@ -26,6 +26,13 @@ The GIN functionality can be tested (proxy mode) using the latest version of ncc
 ./alltoall_perf -R 2 -D 3
 ```
 
+## Slingshot / CXI
+
+GIN proxy mode also runs on HPE Slingshot (CXI) with an upstream libfabric. See
+[gin-slingshot/README.md](gin-slingshot/README.md) for build instructions
+(NCCL, libfabric, this plugin), the required environment variables, and how to
+build and run NCCL EP and M2N on top of it.
+
 ## EFA-GDA (Elastic Fabric Adapter - GPU Direct Async)
 
 EFA ([Elastic Fabric Adapter](https://aws.amazon.com/hpc/efa/)) is a high-performance network interface for EC2, supporting low-latency communication at scale with OS bypass.

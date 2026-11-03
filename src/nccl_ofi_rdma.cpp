@@ -15,6 +15,9 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef HAVE_RDMA_FI_EXT_EFA_H
+#include <rdma/fi_ext_efa.h>
+#endif
 
 #include "nccl_ofi.h"
 #include "nccl_ofi_log.h"
@@ -177,7 +180,7 @@ static nccl_net_ofi_rdma_close_msg_t *rdma_send_close_get_msg
 }
 
 
-nccl_net_ofi_rdma_ep_t *nccl_net_ofi_rdma_send_comm::get_ep()
+nccl_net_ofi_rdma_ep_t *nccl_net_ofi_rdma_send_comm::get_ep() const
 {
 	return (nccl_net_ofi_rdma_ep_t *)this->ep.get();
 }
@@ -191,7 +194,7 @@ nccl_net_ofi_rdma_recv_comm_rail_t *nccl_net_ofi_rdma_recv_comm::get_control_rai
 	return &this->control_rails[rail_id];
 }
 
-nccl_net_ofi_rdma_ep_t *nccl_net_ofi_rdma_recv_comm::get_ep()
+nccl_net_ofi_rdma_ep_t *nccl_net_ofi_rdma_recv_comm::get_ep() const
 {
 	return (nccl_net_ofi_rdma_ep_t *)this->ep.get();
 }
@@ -396,7 +399,7 @@ static inline size_t ofi_info_list_length(struct fi_info *info_list)
 }
 
 
-int nccl_net_ofi_rdma_device_t::get_properties(nccl_ofi_properties_t *props)
+int nccl_net_ofi_rdma_device_t::get_properties(nccl_ofi_properties_t *props) const
 {
 	int ret;
 	const nccl_net_ofi_rdma_plugin_t *plugin_ptr = this->rdma_device_get_plugin();
@@ -419,7 +422,6 @@ int nccl_net_ofi_rdma_device_t::get_properties(nccl_ofi_properties_t *props)
 		static_assert(NCCL_OFI_MAX_RECVS <= (1 << NCCL_OFI_RDMA_RECV_IDX_BITS),
 					  "NCCL_OFI_MAX_RECVS must fit in RECV_IDX_BITS");
 		props->max_communicators = NCCL_OFI_RDMA_MAX_COMMS;
-		this->eager_support = props->eager_support;
 	} else {
 		return ret;
 	}
@@ -2996,7 +2998,7 @@ int nccl_net_ofi_rdma_domain_t::dereg_mr(nccl_net_ofi_rdma_mr_handle_t *mr_handl
 		return 0;
 	}
 
-	if (this->mr_cache) {
+	if (this->mr_cache_enabled) {
 		std::lock_guard cache_guard(this->mr_cache_lock);
 
 		/*
@@ -3004,7 +3006,7 @@ int nccl_net_ofi_rdma_domain_t::dereg_mr(nccl_net_ofi_rdma_mr_handle_t *mr_handl
 		* itself, this call would either just decrement the refcnt, or delete
 		* the entry for this handle.
 		*/
-		int ret = this->mr_cache->del_entry(mr_handle);
+		int ret = this->mr_cache.del_entry(mr_handle);
 		if (OFI_UNLIKELY(ret < 0)) {
 			NCCL_OFI_WARN("Failed to delete MR cache entry");
 		} else if (ret == 0) {
@@ -3023,13 +3025,13 @@ int nccl_net_ofi_rdma_domain_t::dereg_mr_no_lock(nccl_net_ofi_rdma_mr_handle_t *
 		return 0;
 	}
 
-	if (this->mr_cache) {
+	if (this->mr_cache_enabled) {
 		/*
 		* Depending on the number of references on this handle and the cache
 		* itself, this call would either just decrement the refcnt, or delete
 		* the entry for this handle.
 		*/
-		int ret = this->mr_cache->del_entry(mr_handle);
+		int ret = this->mr_cache.del_entry(mr_handle);
 		if (OFI_UNLIKELY(ret < 0)) {
 			NCCL_OFI_WARN("Failed to delete MR cache entry");
 		} else if (ret == 0) {
@@ -3039,29 +3041,6 @@ int nccl_net_ofi_rdma_domain_t::dereg_mr_no_lock(nccl_net_ofi_rdma_mr_handle_t *
 	}
 
 	dereg_mr_on_device(mr_handle);
-	return 0;
-}
-
-
-int nccl_net_ofi_rdma_domain_t::mr_bind_and_enable(struct fid_mr *mr,
-						   struct fid_ep *ofi_ep,
-						   uint16_t rail_id,
-						   const char *rail_type)
-{
-	int ret = fi_mr_bind(mr, &ofi_ep->fid, 0);
-	if (ret != 0) {
-		NCCL_OFI_WARN("fi_mr_bind (%s rail %u) failed: rc=%d, error=%s",
-			      rail_type, rail_id, ret, fi_strerror(-ret));
-		return ret;
-	}
-
-	ret = fi_mr_enable(mr);
-	if (ret != 0) {
-		NCCL_OFI_WARN("fi_mr_enable failed on %s rail %u with rc=%d, error=%s",
-			      rail_type, rail_id, ret, fi_strerror(-ret));
-		return ret;
-	}
-
 	return 0;
 }
 
@@ -3128,8 +3107,9 @@ int nccl_net_ofi_rdma_domain_t::reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
 		if (ep != nullptr) {
 			nccl_net_ofi_rdma_ep_rail_t *ep_rail = ep->rdma_endpoint_get_rail(rail_id);
 			struct fid_ep *ofi_ep = ep_rail->ofi_ep.get();
-			ret = mr_bind_and_enable(ret_handle->mr_data[rail_id].get(), ofi_ep,
-						 rail_id, "data");
+			ret = nccl_ofi_ofiutils_mr_bind_and_enable(
+				ret_handle->mr_data[rail_id].get(), ofi_ep,
+				rail_id, "data");
 			if (ret != 0) goto error;
 		}
 	}
@@ -3153,8 +3133,9 @@ int nccl_net_ofi_rdma_domain_t::reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
 
 			nccl_net_ofi_rdma_ep_rail_t *ctrl_rail = ep->rdma_endpoint_get_control_rail(rail_id);
 			struct fid_ep *ctrl_ofi_ep = ctrl_rail->ofi_ep.get();
-			ret = mr_bind_and_enable(ret_handle->mr_ctrl_owned[rail_id].get(), ctrl_ofi_ep,
-						 rail_id, "ctrl");
+			ret = nccl_ofi_ofiutils_mr_bind_and_enable(
+				ret_handle->mr_ctrl_owned[rail_id].get(), ctrl_ofi_ep,
+				rail_id, "ctrl");
 			if (ret != 0) goto error;
 
 			ret_handle->mr_ctrl[rail_id] = ret_handle->mr_ctrl_owned[rail_id].get();
@@ -3190,7 +3171,7 @@ int nccl_net_ofi_rdma_domain_t::reg_mr(nccl_ofi_mr_ckey_ref ckey,
 	nccl_net_ofi_rdma_mr_handle_t *ret_handle = NULL;
 	*mhandle = NULL;
 
-	if (this->mr_cache) {
+	if (this->mr_cache_enabled) {
 		/*
 		 * MR cache is locked between lookup and insert, to be sure we
 		 * insert a missing entry.
@@ -3198,7 +3179,7 @@ int nccl_net_ofi_rdma_domain_t::reg_mr(nccl_ofi_mr_ckey_ref ckey,
 		std::lock_guard cache_guard(this->mr_cache_lock);
 
 		ret_handle = static_cast<nccl_net_ofi_rdma_mr_handle_t *>(
-			this->mr_cache->lookup_entry(ckey, endpoint_mr));
+			this->mr_cache.lookup_entry(ckey, endpoint_mr));
 		if (ret_handle) {
 			/* Cache hit */
 			*mhandle = ret_handle;
@@ -3211,7 +3192,7 @@ int nccl_net_ofi_rdma_domain_t::reg_mr(nccl_ofi_mr_ckey_ref ckey,
 			return ret;
 		}
 
-		ret = this->mr_cache->insert_entry(ckey,
+		ret = this->mr_cache.insert_entry(ckey,
 						     endpoint_mr,
 						     ret_handle);
 		if (OFI_UNLIKELY(ret != 0)) {
@@ -7051,6 +7032,29 @@ nccl_net_ofi_rdma_device_t::nccl_net_ofi_rdma_device_t(nccl_net_ofi_plugin_t *pl
 	}
 
 	/* The fabrics are created lazily on first use; see create_domain(). */
+
+	/* Verify support for eager messages */
+#if HAVE_DECL_FI_EFA_FEATURE_OPS
+	{ /* Scope block: C++ forbids goto past auto variable initialization */
+		auto fabric_result = nccl_ofi_ofiutils_fabric_create(this->device_rails[0].info);
+		if (OFI_UNLIKELY(fabric_result.is_failure())) {
+			NCCL_OFI_WARN("Couldn't open a fabric provider. RC: %d, ERROR: %s",
+				      fabric_result.error_code, fi_strerror(-fabric_result.error_code));
+			ret = fabric_result.error_code;
+			throw std::runtime_error("Opening fabric provider for eager check failed");
+		}
+
+		struct fi_efa_feature_ops *feat_ops = NULL;
+		ret = fi_open_ops(&fabric_result.resource->fid, FI_EFA_FEATURE_OPS, 0,
+				  (void **)&feat_ops, NULL);
+		if (ret != 0) {
+			NCCL_OFI_WARN("fi_open_ops for EFA features failed. RC: %d, ERROR: %s",
+				      ret, fi_strerror(-ret));
+		} else if (feat_ops->query("mixed_hmem_iov")) {
+			this->eager_support = true;
+		}
+	}
+#endif
 
 	/* NVTX domain */
 #if HAVE_NVTX_TRACING

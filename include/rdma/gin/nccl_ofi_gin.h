@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <type_traits>
@@ -61,94 +62,35 @@ public:
 	}
 
 	int connect(nccl_net_ofi_conn_handle_t *handles[], int nranks, int rank,
-		    nccl_ofi_gin_put_comm_t **gin_comm_out) override;
+		    nccl_ofi_gin_put_comm_t **gin_comm_out,
+		    nccl_ofi_gin_abort_token abort) override;
 };
 
 /**
- * Represents per-peer-rank data associated with a collective communicator.
- *
- * The collective communicator stores a vector of these structures, of size
- * nranks.
- *
- * Producer/consumer flow-control model
- * ------------------------------------
- * Each peer pair maintains four monotonically-advancing cursors of width
- * GIN_RX_CONSUMED_BITS (= GIN_IMM_SEQ_BITS + 1, so exactly 2x the seq
- * window). Cursors wrap at GIN_RX_CONSUMED_MASK + 1 and are stored in a
- * uint32_t backing for cheap arithmetic.
- *
- *   tx_head     - sender: ops produced (advances on every iputSignal)
- *   tx_tail     - sender's local view of "ops the receiver has consumed"
- *                 (advances when a standalone ACK arrives)
- *   rx_consumed - receiver: ops delivered upstream in seq order
- *
- * Wrap-safe forward delta is computed as
- *     ((b - a) & GIN_RX_CONSUMED_MASK)
- * which is in [0, 2x seq window). A delta in the lower half is "forward",
- * in the upper half is "backward" (older ACK or duplicate).
- *
- * Invariants:
- *   outstanding   = (tx_head - tx_tail) & GIN_RX_CONSUMED_MASK
- *   tx may send   iff outstanding < GIN_IMM_SEQ_MASK + 1
- *   ack-request   when outstanding >= GIN_ACK_REQ_THRESHOLD
- *
- * The wire seq number is the low GIN_IMM_SEQ_BITS of tx_head.
- * The wire `rx_consumed` field is the entire receiver-side cursor
- * (since cursor width matches wire width).
+ * Resource releaser, just to make sure it is cleaned up properly.
  */
-struct nccl_ofi_gin_peer_rank_info {
-	/* Remote comm id */
-	uint32_t comm_id;
+struct nccl_ofi_gin_resource_releaser {
+	explicit nccl_ofi_gin_resource_releaser(nccl_ofi_gin_resources &resources_arg)
+		: resources(resources_arg)
+	{
+	}
 
-	/* Rail addresses */
-	fi_addr_t address[MAX_NUM_RAILS];
+	void activate()
+	{
+		active = true;
+	}
 
-	/* Sender-side cursors. tx_head is the next ring-position we'll
-	   produce; tx_tail is the latest position the receiver has
-	   acknowledged consuming. tx_head's low GIN_IMM_SEQ_BITS go on
-	   the wire as msg_seq_num. */
-	uint32_t tx_head = 0;
-	uint32_t tx_tail = 0;
+	~nccl_ofi_gin_resource_releaser()
+	{
+		if (active) {
+			std::lock_guard lock(resources.get_ep().ep_lock);
+			resources.release();
+		}
+	}
 
-	/* Receiver-side cursor. rx_consumed advances every time we retire
-	   an op in seq order (signal delivered upstream). */
-	uint32_t rx_consumed = 0;
-
-	/* Hysteresis counter for the sender-side ack-request gate. Once
-	   outstanding crosses GIN_ACK_REQ_THRESHOLD this counts ops; only
-	   every GIN_ACK_INTERVAL'th op flips ack_req on the wire. Without
-	   this, every op above threshold would request an ACK and we'd
-	   flood the receiver with standalone ACK packets. */
-	uint32_t consecutive_puts_without_ack = 0;
-
-	/* Sequence-number tracking for close-time drain.
-	   last_ack_requested_seq records tx_head at the time the most
-	   recent is_ack_requested was set on the wire.
-	   closeColl waits until a standalone ACK covers this sequence. */
-	uint32_t last_ack_requested_seq = 0;
-	bool has_pending_ack_request = false;
-
-	/**
-	 * Next-to-be-delivered sequence number, stored at target, from
-	 * (initiator) peer rank. Mirrors the low GIN_IMM_SEQ_BITS of
-	 * rx_consumed; kept as a separate field to match how it is read
-	 * (compared against incoming msg_seq_num bitfield).
-	 */
-	uint16_t next_delivered_signal_seq_num = 0;
+	nccl_ofi_gin_resources &resources;
+	bool active = false;
 };
-
-/* Helpers for the cursor ring. Cursors are uint32_t in memory but we
-   never let them advance past GIN_RX_CONSUMED_MASK, so subtraction is
-   performed under the same mask. */
-static inline uint32_t gin_cursor_inc(uint32_t c)
-{
-	return (c + 1) & GIN_RX_CONSUMED_MASK;
-}
-
-static inline uint32_t gin_cursor_delta(uint32_t lhs, uint32_t rhs)
-{
-	return (lhs - rhs) & GIN_RX_CONSUMED_MASK;
-}
 
 /**
  * Representation of a remote rank's memory registration
@@ -158,11 +100,11 @@ struct gin_remote_mr {
 	uintptr_t address;
 
 	/* Offset for RMA operations. For virt_addr_mr providers, this is equal
-	   to address. For non-virt_addr_mr providers, this is zero.
+	   to address. For non-virt_addr_mr providers, this is the buffer's
+	   offset from the registered base.
 
-	   Note: we need both of these, because when address_offset is zero, the
-	   actual virtual address is still needed for MR lookup in the signal
-	   delivery path. */
+	   The actual virtual address is still needed for MR lookup in the
+	   signal delivery path. */
 	uintptr_t address_offset;
 
 	int num_rails;
@@ -433,7 +375,8 @@ private:
 class nccl_ofi_rdma_gin_put_comm : public nccl_ofi_gin_put_comm_t {
 public:
 	nccl_ofi_rdma_gin_put_comm(std::shared_ptr<nccl_ofi_gin_resources> resources_arg, int rank_, int nranks_,
-			  nccl_net_ofi_send_comm *s_comm_, nccl_net_ofi_recv_comm *r_comm_);
+			  nccl_ofi_gin_ring_send_comm s_comm_, nccl_ofi_gin_ring_recv_comm r_comm_,
+			  nccl_ofi_gin_abort_token abort_ = {});
 
 	~nccl_ofi_rdma_gin_put_comm();
 
@@ -465,6 +408,11 @@ public:
 	nccl_ofi_gin_allgather_comm &get_ag_comm()
 	{
 		return ag_comm;
+	}
+
+	nccl_ofi_gin_abort_token get_abort_token() const
+	{
+		return ag_comm.get_abort_token();
 	}
 
 	int get_dev() const
@@ -542,16 +490,20 @@ public:
 		}
 	}
 
+	void update_shared_cq_window_limit(uint32_t new_limit) REQUIRES(get_ep_lock())
+	{
+		flow_ctx.conservative_refresh_window = new_limit;
+		for (auto &rank_comm : rank_comms) {
+			if (rank_comm.current_window_limit > new_limit) {
+				rank_comm.current_window_limit = new_limit;
+				rank_comm.consecutive_puts_without_ack = 0;
+			}
+		}
+	}
+
 	/* Wait for any outstanding requests as necessary. Should be called before
 	   the GIN comm is destructed. Acquires/releases ep_lock internally. */
 	int await_pending_requests() EXCLUDES(get_ep_lock()) override;
-
-	/**
-	 * Spin-wait until the per-peer outstanding window has at least one free
-	 * slot. Drives CQ progress and gdrcopy drain each iteration so that
-	 * ACKs from the receiver advance tx_tail.
-	 */
-	int await_tx_window(nccl_ofi_gin_peer_rank_info &rank_comm) EXCLUDES(get_ep_lock());
 
 	/**
 	 * iputSignal API. Transfers some user data (determined by memory registrations
@@ -629,7 +581,7 @@ public:
 	 * @param src_addr: source address of the ACK sender
 	 * @param rail_id: rail on which the ACK was received
 	 */
-	int handle_ack_completion(const gin_ack_msg_t *ack_msg, fi_addr_t src_addr,
+	int handle_ack_completion(const gin_ack_msg *ack_msg, fi_addr_t src_addr,
 				  uint16_t rail_id);
 
 private:
@@ -643,6 +595,9 @@ private:
 	   Access via get_resources(); the shared_ptr deref is free under
 	   optimization, so there is no separate reference member to keep in sync. */
 	std::shared_ptr<nccl_ofi_gin_resources> resources_sp;
+	nccl_ofi_gin_resource_releaser resource_releaser;
+	std::unique_ptr<gin_flow_policy> flow_policy;
+	gin_flow_context flow_ctx;
 
 	/* Remote comm info book */
 	std::vector<nccl_ofi_gin_peer_rank_info> rank_comms;
@@ -656,19 +611,16 @@ private:
 	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> metadata_fl;
 	int dev;
 
+	/* Whether the selected logical GIN device reaches its associated GPU
+	 * through PCIe. */
+	bool selected_nic_uses_pcie = false;
+
 	/* CUDA context of the thread that created this comm. Signal-segment
 	   discovery makes it current when it runs on a thread that has none
 	   (NCCL's GIN progress threads are bare std::threads). */
 	CUcontext gdrcopy_cuda_ctx = nullptr;
 
 	/* --- TIER 2: Receiver side — every CQ completion --- */
-	/* Rail pinned across an aggregated iputSignal sequence: when an op is
-	   posted with FI_MORE, the next op must reuse this rail to flush it.
-	   -1 means no pin (consult get_next_rail()). Guarded by ep_lock. */
-	int pinned_rail_id = -1;
-	/* Count of ops coalesced onto pinned_rail_id so far. The pin rotates to
-	   the next rail after GIN_REQS_PER_DOORBELL. Guarded by ep_lock. */
-	uint32_t pinned_rail_run = 0;
 	/* For each rail, direct-indexed table of fi_addr => peer comm rank.
 	 * Requires FI_AV_TABLE so that fi_addr_t values are dense 0-based
 	 * indices. Unused slots are set to UINT32_MAX as a sentinel. */
@@ -710,23 +662,13 @@ private:
 	/* --- Private methods --- */
 
 	/**
-	 * Send a standalone ACK via fi_send to the peer carrying our
-	 * receiver-side rx_consumed cursor. Sender uses this to advance its
-	 * tx_tail and free up window slots.
+	 * Send a standalone ACK via fi_send to the peer carrying the
+	 * endpoint-selected ACK payload prepared for the active provider mode.
 	 *
-	 * @param gin_comm communicator to send the ACK on
 	 * @param peer_rank rank to send the acknowledgement to
-	 * @param rx_consumed receiver's rx_consumed cursor at this moment
+	 * @param ack_msg prepared ACK payload
 	 */
-	int send_ack(nccl_ofi_rdma_gin_put_comm &gin_comm, uint32_t peer_rank,
-		     uint32_t rx_consumed) REQUIRES(get_ep_lock());
-
-	/* Update the pinned-rail state after an op posted on `rail_id`:
-	   - deferring: this op kept its doorbell (FI_MORE); hold the rail and
-	     count it toward the rotation interval.
-	   - otherwise: this op rang its doorbell, so nothing is left deferred;
-	     release the pin (the next op re-pins on the scheduler's rail). */
-	void update_pin(bool defer, uint16_t rail_id)
+	int send_ack(uint32_t peer_rank, const gin_ack_msg &ack_msg)
 		REQUIRES(get_ep_lock());
 
 	/* Look up the signal's GDRCopy handle in mr_handle_map and fill `work`
