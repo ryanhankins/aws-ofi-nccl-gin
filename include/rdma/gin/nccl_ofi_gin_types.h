@@ -78,8 +78,11 @@ public:
 	virtual void prepare_ack(const nccl_ofi_gin_peer_rank_info &peer,
 				uint32_t rx_consumed, gin_ack_msg_t &ack) = 0;
 
+	/* is_newest_ack is true when this ACK advanced the peer's tx_tail.
+	 * ACKs can be reordered across rails, so older ACKs may arrive late. */
 	virtual void process_ack(nccl_ofi_gin_peer_rank_info &peer,
-			 const gin_ack_msg_t &ack) = 0;
+				 const gin_ack_msg_t &ack,
+				 bool is_newest_ack) = 0;
 };
 
 /**
@@ -443,10 +446,13 @@ static inline uint32_t gin_granted_window_get_max_limit()
 
 /* Apply a receiver-advertised grant to a peer's sender window. A zero grant
    means an older/skewed peer did not advertise one; leave the window alone.
-   Shrinking resets the ACK hysteresis counter so the next op can re-arm the
-   ack_req gate under the smaller window. */
+   Only an ACK that advanced tx_tail may widen the window: a reordered older
+   ACK can carry a grant computed before the receiver's CQ budget shrank, so
+   it may only shrink the window. Shrinking resets the ACK hysteresis counter
+   so the next op can re-arm the ack_req gate under the smaller window. */
 static inline void gin_apply_granted_window(nccl_ofi_gin_peer_rank_info &peer,
-			uint32_t granted_window)
+					    uint32_t granted_window,
+					    bool is_newest_ack)
 {
 	if (granted_window == 0) {
 		return;
@@ -454,6 +460,9 @@ static inline void gin_apply_granted_window(nccl_ofi_gin_peer_rank_info &peer,
 	const uint32_t old_limit = peer.current_window_limit;
 	const uint32_t new_limit =
 		std::clamp<uint32_t>(granted_window, 1, gin_granted_window_get_max_limit());
+	if (!is_newest_ack && new_limit > old_limit) {
+		return;
+	}
 	peer.current_window_limit = new_limit;
 	if (new_limit < old_limit) {
 		peer.consecutive_puts_without_ack = 0;

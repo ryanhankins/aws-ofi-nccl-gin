@@ -1856,10 +1856,10 @@ int nccl_ofi_rdma_gin_put_comm::handle_ack_completion(const gin_ack_msg_t *ack_m
 
 	/* The wire ACK carries the receiver's full rx_consumed cursor.
 	   apply_rx_consumed() advances tx_tail wrap-safely; older ACKs
-	   arriving after newer ones are no-ops because they don't move
-	   tx_tail forward. */
-	apply_rx_consumed(peer_rank, rx_consumed);
-	flow_policy->process_ack(rank_comms[peer_rank], *ack_msg);
+	   arriving after newer ones don't move tx_tail forward, and the
+	   flow policy must not let them widen the sender window. */
+	const bool is_newest_ack = apply_rx_consumed(peer_rank, rx_consumed);
+	flow_policy->process_ack(rank_comms[peer_rank], *ack_msg, is_newest_ack);
 
 	NCCL_OFI_TRACE_GIN_HANDLE_ACK_COMPLETION_FUNC_END(dev, this, rail_id, peer_rank,
 						  rx_consumed, 0);

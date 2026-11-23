@@ -17,7 +17,9 @@ public:
 	void prepare_ack(const nccl_ofi_gin_peer_rank_info &peer, uint32_t rx_consumed,
 			 gin_ack_msg_t &ack) override;
 
-	void process_ack(nccl_ofi_gin_peer_rank_info &peer, const gin_ack_msg_t &ack) override;
+	void process_ack(nccl_ofi_gin_peer_rank_info &peer,
+			 const gin_ack_msg_t &ack,
+			 bool is_newest_ack) override;
 };
 
 #endif

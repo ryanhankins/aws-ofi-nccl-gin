@@ -65,12 +65,14 @@ void gin_flow_writedata_routed::prepare_ack(
 		gin_cxi_eq_get_window_limit(nranks));
 }
 
-void gin_flow_writedata_routed::process_ack(
-	nccl_ofi_gin_peer_rank_info &peer, const gin_ack_msg_t &ack)
+void gin_flow_writedata_routed::process_ack(nccl_ofi_gin_peer_rank_info &peer,
+					    const gin_ack_msg_t &ack,
+					    bool is_newest_ack)
 {
-	gin_apply_granted_window(
-		peer, std::min<uint32_t>(static_cast<uint32_t>(ack.granted_window),
-					 gin_cxi_eq_get_window_limit(nranks)));
+	gin_apply_granted_window(peer,
+				 std::min<uint32_t>(static_cast<uint32_t>(ack.granted_window),
+						    gin_cxi_eq_get_window_limit(nranks)),
+				 is_newest_ack);
 
 	gin_complete_pending_ack_request(peer, ack.rx_consumed);
 }

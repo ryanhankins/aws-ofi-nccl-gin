@@ -484,15 +484,19 @@ public:
 	 * thanks to the bitfield bring-in. We compute the modular forward
 	 * delta from tx_tail; out-of-order older ACKs land in the upper half
 	 * of the ring and are dropped.
+	 *
+	 * @return true if the cursor advanced tx_tail (newest ACK seen so far)
 	 */
-	void apply_rx_consumed(uint32_t peer_rank, uint32_t wire_rx_consumed)
+	bool apply_rx_consumed(uint32_t peer_rank, uint32_t wire_rx_consumed)
 	{
 		auto &rank_comm = rank_comms[peer_rank];
 		const uint32_t delta = gin_cursor_delta(wire_rx_consumed,
 							rank_comm.tx_tail);
 		if (delta > 0 && delta <= GIN_RX_CONSUMED_HALF) {
 			rank_comm.tx_tail = wire_rx_consumed;
+			return true;
 		}
+		return false;
 	}
 
 	void update_shared_cq_window_limit(uint32_t new_limit) REQUIRES(get_ep_lock())

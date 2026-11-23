@@ -26,6 +26,7 @@ struct grant_case {
 	uint32_t start_limit;
 	uint32_t start_hysteresis;
 	uint32_t granted;
+	bool is_newest_ack;
 	uint32_t expect_limit;
 	uint32_t expect_hysteresis;
 };
@@ -146,33 +147,44 @@ int main(int argc, char *argv[])
 	 * peer's sender window. Zero leaves the window untouched; growth and
 	 * equal grants preserve the ACK hysteresis counter; only a strict
 	 * shrink resets it so the ack_req gate can re-arm under the smaller
-	 * window; an over-max grant clamps to gin_granted_window_get_max_limit(). */
+	 * window; an over-max grant clamps to gin_granted_window_get_max_limit().
+	 * A stale (reordered) ACK may shrink the window but never widen it. */
 	const uint32_t max_grant = gin_granted_window_get_max_limit();
 	const grant_case grant_cases[] = {
 		/* zero grant: window and hysteresis both untouched */
-		{64, 7, 0, 64, 7},
+		{ 64, 7, 0, true, 64, 7 },
 		/* growth: window rises, hysteresis preserved */
-		{64, 7, 128, 128, 7},
+		{ 64, 7, 128, true, 128, 7 },
 		/* shrink: window falls, hysteresis resets */
-		{128, 7, 64, 64, 0},
+		{ 128, 7, 64, true, 64, 0 },
 		/* equal: no shrink, so no reset */
-		{64, 7, 64, 64, 7},
+		{ 64, 7, 64, true, 64, 7 },
 		/* over-max grant clamps down; from a smaller window that is growth */
-		{64, 7, GIN_ACK_GRANT_MAX, max_grant, 7},
+		{ 64, 7, GIN_ACK_GRANT_MAX, true, max_grant, 7 },
 		/* clamp floor: grant of 1 is the smallest legal window */
-		{64, 7, 1, 1, 0},
+		{ 64, 7, 1, true, 1, 0 },
+		/* stale grant 100 after grant 10: must not widen */
+		{ 10, 7, 100, false, 10, 7 },
+		/* stale grant may still shrink */
+		{ 64, 7, 10, false, 10, 0 },
+		/* stale equal grant: unchanged */
+		{ 64, 7, 64, false, 64, 7 },
 	};
 	for (const auto &tc : grant_cases) {
 		nccl_ofi_gin_peer_rank_info peer = {};
 		peer.current_window_limit = tc.start_limit;
 		peer.consecutive_puts_without_ack = tc.start_hysteresis;
-		gin_apply_granted_window(peer, tc.granted);
+		gin_apply_granted_window(peer, tc.granted, tc.is_newest_ack);
 		if (peer.current_window_limit != tc.expect_limit ||
 		    peer.consecutive_puts_without_ack != tc.expect_hysteresis) {
-			printf("Grant apply failed: start=%u granted=%u -> limit=%u hyst=%u "
-			       "(expected limit=%u hyst=%u)\n",
-			       tc.start_limit, tc.granted, peer.current_window_limit,
-			       peer.consecutive_puts_without_ack, tc.expect_limit,
+			printf("Grant apply failed: start=%u granted=%u newest=%d -> "
+			       "limit=%u hyst=%u (expected limit=%u hyst=%u)\n",
+			       tc.start_limit,
+			       tc.granted,
+			       tc.is_newest_ack,
+			       peer.current_window_limit,
+			       peer.consecutive_puts_without_ack,
+			       tc.expect_limit,
 			       tc.expect_hysteresis);
 			return 1;
 		}
