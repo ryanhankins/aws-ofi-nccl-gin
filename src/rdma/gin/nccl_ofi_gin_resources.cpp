@@ -989,25 +989,19 @@ int nccl_ofi_gin_resources::cancel_and_drain_recv_reqs()
 		req.cancel();
 	}
 
-	for (size_t attempt = 0; attempt < GIN_RECV_DRAIN_MAX_POLLS; ++attempt) {
-		const bool outstanding = std::any_of(recv_reqs.begin(), recv_reqs.end(),
-						      [](const auto &req) {
-							      return req.has_outstanding_post();
-						      });
-		if (!outstanding) {
-			return 0;
-		}
-		int ret = gin_ep.process_cq();
-		if (OFI_UNLIKELY(ret < 0)) {
-			NCCL_OFI_WARN("Error draining CQ while cancelling GIN receives: %d", ret);
-			return ret;
-		}
-		if (ret == 0) {
-			std::this_thread::yield();
-		}
+	int ret = gin_recv_reqs_drain(
+		GIN_RECV_DRAIN_MAX_POLLS,
+		[this]() {
+			return std::any_of(recv_reqs.begin(), recv_reqs.end(), [](const auto &req) {
+				return req.has_outstanding_post();
+			});
+		},
+		[this]() { return gin_ep.process_cq(); });
+	if (ret == -ETIMEDOUT) {
+		NCCL_OFI_WARN("Timed out after %zu CQ polls draining cancelled GIN receives",
+			      GIN_RECV_DRAIN_MAX_POLLS);
+	} else if (OFI_UNLIKELY(ret != 0)) {
+		NCCL_OFI_WARN("Error draining CQ while cancelling GIN receives: %d", ret);
 	}
-
-	NCCL_OFI_WARN("Timed out after %zu CQ polls draining cancelled GIN receives",
-		      GIN_RECV_DRAIN_MAX_POLLS);
-	return -ETIMEDOUT;
+	return ret;
 }

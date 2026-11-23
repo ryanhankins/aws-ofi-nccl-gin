@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 #include <unordered_map>
 
@@ -33,6 +34,33 @@ static inline void freelist_deleter(nccl_ofi_freelist *fl)
  * Cancellation normally completes within a few polls; the bound only keeps
  * teardown from hanging on a provider that never reports it. */
 static constexpr size_t GIN_RECV_DRAIN_MAX_POLLS = 10000;
+
+/**
+ * @brief Poll until no cancelled receive is outstanding.
+ *
+ * @param max_polls bound on poll() calls
+ * @param has_outstanding returns true while any receive is still posted
+ * @param poll progresses the CQ; returns a completion count or -errno
+ * @return 0 once drained, poll()'s error, or -ETIMEDOUT
+ */
+template <typename HasOutstanding, typename Poll>
+static inline int
+gin_recv_reqs_drain(size_t max_polls, HasOutstanding &&has_outstanding, Poll &&poll)
+{
+	for (size_t attempt = 0; attempt < max_polls; ++attempt) {
+		if (!has_outstanding()) {
+			return 0;
+		}
+		int ret = poll();
+		if (OFI_UNLIKELY(ret < 0)) {
+			return ret;
+		}
+		if (ret == 0) {
+			std::this_thread::yield();
+		}
+	}
+	return has_outstanding() ? -ETIMEDOUT : 0;
+}
 
 /**
  * A rail of the GIN endpoint
