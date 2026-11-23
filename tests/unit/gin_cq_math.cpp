@@ -69,8 +69,8 @@ int main(int argc, char *argv[])
 	    gin_rank_count_is_valid(max_wire_ranks + 1, true) ||
 	    !gin_rank_count_is_valid(max_wire_ranks + 1, false) ||
 	    gin_rank_count_is_valid(0, true) ||
-	    gin_required_cq_data_size(true) != sizeof(uint64_t) ||
-	    gin_required_cq_data_size(false) != sizeof(uint32_t)) {
+	    gin_cq_data_get_required_size(true) != sizeof(uint64_t) ||
+	    gin_cq_data_get_required_size(false) != sizeof(uint32_t)) {
 		printf("Endpoint-MR rank or CQ data-width requirement failed\n");
 		return 1;
 	}
@@ -175,7 +175,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* gin_apply_granted_window(): a receiver-advertised grant applied to a
+	/* apply_granted_window(): a receiver-advertised grant applied to a
 	 * peer's sender window. Zero leaves the window untouched; growth and
 	 * equal grants preserve the ACK hysteresis counter; only a strict
 	 * shrink resets it so the ack_req gate can re-arm under the smaller
@@ -206,7 +206,7 @@ int main(int argc, char *argv[])
 		nccl_ofi_gin_peer_rank_info peer = {};
 		peer.current_window_limit = tc.start_limit;
 		peer.consecutive_puts_without_ack = tc.start_hysteresis;
-		gin_apply_granted_window(peer, tc.granted, tc.is_newest_ack);
+		peer.apply_granted_window(tc.granted, tc.is_newest_ack);
 		if (peer.current_window_limit != tc.expect_limit ||
 		    peer.consecutive_puts_without_ack != tc.expect_hysteresis) {
 			printf("Grant apply failed: start=%u granted=%u newest=%d -> "
@@ -222,7 +222,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* gin_complete_pending_ack_request(): a backward/duplicate rx_consumed
+	/* complete_pending_ack_request(): a backward/duplicate rx_consumed
 	 * (delta in the upper half of the cursor range, i.e. an older or
 	 * reordered ACK arriving after a newer one) must not clear a still-
 	 * pending ack request. */
@@ -234,7 +234,7 @@ int main(int argc, char *argv[])
 		 * to a large forward delta (near GIN_RX_CONSUMED_MASK), landing in
 		 * the upper half -> treated as backward/stale. */
 		const uint32_t backward_rx_consumed = 50;
-		gin_complete_pending_ack_request(peer, backward_rx_consumed);
+		peer.complete_pending_ack_request(backward_rx_consumed);
 		if (!peer.has_pending_ack_request) {
 			printf("Backward ACK incorrectly cleared has_pending_ack_request: "
 			       "last_ack_requested_seq=%u rx_consumed=%u\n",
@@ -250,7 +250,7 @@ int main(int argc, char *argv[])
 		/* rx_consumed exactly equal to last_ack_requested_seq means the request
 		 * op has not been retired yet. The ACK doesn't cover it. */
 		const uint32_t exact_rx_consumed = 100;
-		gin_complete_pending_ack_request(peer, exact_rx_consumed);
+		peer.complete_pending_ack_request(exact_rx_consumed);
 		if (!peer.has_pending_ack_request) {
 			printf("Exact (non-covering) ACK incorrectly cleared "
 			       "has_pending_ack_request: "

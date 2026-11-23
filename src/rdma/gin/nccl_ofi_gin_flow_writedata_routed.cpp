@@ -59,7 +59,7 @@ void gin_flow_writedata_routed::prepare_ack(
 	const nccl_ofi_gin_peer_rank_info &peer,
 	uint32_t rx_consumed, gin_ack_msg &ack)
 {
-	gin_fill_ack_header(peer, rx_consumed, ack);
+	peer.fill_ack_header(rx_consumed, ack);
 	ack.granted_window = std::min(
 		resources.get_shared_cq_window_limit(nranks),
 		gin_cxi_eq_get_window_limit(nranks));
@@ -69,10 +69,9 @@ void gin_flow_writedata_routed::process_ack(nccl_ofi_gin_peer_rank_info &peer,
 					    const gin_ack_msg &ack,
 					    bool is_newest_ack)
 {
-	gin_apply_granted_window(peer,
-				 std::min<uint32_t>(static_cast<uint32_t>(ack.granted_window),
-						    gin_cxi_eq_get_window_limit(nranks)),
-				 is_newest_ack);
+	peer.apply_granted_window(std::min<uint32_t>(static_cast<uint32_t>(ack.granted_window),
+						     gin_cxi_eq_get_window_limit(nranks)),
+				  is_newest_ack);
 
-	gin_complete_pending_ack_request(peer, ack.rx_consumed);
+	peer.complete_pending_ack_request(ack.rx_consumed);
 }

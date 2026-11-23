@@ -213,7 +213,7 @@ static inline bool gin_rank_count_is_valid(int nranks, bool uses_endpoint_mr)
 		 static_cast<uint64_t>(nranks) <= (1ULL << GIN_MSG_SRC_RANK_BITS));
 }
 
-static inline size_t gin_required_cq_data_size(bool uses_endpoint_mr)
+static inline size_t gin_cq_data_get_required_size(bool uses_endpoint_mr)
 {
 	return uses_endpoint_mr ? sizeof(uint64_t) : sizeof(uint32_t);
 }
@@ -358,6 +358,24 @@ static inline uint32_t gin_cxi_eq_get_window_limit(uint32_t nranks)
 static_assert(GIN_TARGET_GRANTED_WINDOW <= GIN_ACK_GRANT_MAX,
 	      "GIN auto-sized target window must fit in the ACK grant field");
 
+/* Helpers for the cursor ring. Cursors are uint32_t in memory but we
+   never let them advance past GIN_RX_CONSUMED_MASK, so subtraction is
+   performed under the same mask. */
+static inline uint32_t gin_cursor_inc(uint32_t c)
+{
+	return (c + 1) & GIN_RX_CONSUMED_MASK;
+}
+
+static inline uint32_t gin_cursor_delta(uint32_t lhs, uint32_t rhs)
+{
+	return (lhs - rhs) & GIN_RX_CONSUMED_MASK;
+}
+
+static inline uint32_t gin_granted_window_get_max_limit()
+{
+	return std::min<uint32_t>(GIN_IMM_SEQ_MASK + 1, GIN_ACK_GRANT_MAX);
+}
+
 /**
  * Represents per-peer-rank data associated with a collective communicator.
  *
@@ -432,41 +450,52 @@ struct nccl_ofi_gin_peer_rank_info {
 	 * (compared against incoming msg_seq_num bitfield).
 	 */
 	uint16_t next_delivered_signal_seq_num = 0;
-};
 
-/* Helpers for the cursor ring. Cursors are uint32_t in memory but we
-   never let them advance past GIN_RX_CONSUMED_MASK, so subtraction is
-   performed under the same mask. */
-static inline uint32_t gin_cursor_inc(uint32_t c)
-{
-	return (c + 1) & GIN_RX_CONSUMED_MASK;
-}
-
-static inline uint32_t gin_cursor_delta(uint32_t lhs, uint32_t rhs)
-{
-	return (lhs - rhs) & GIN_RX_CONSUMED_MASK;
-}
-
-static inline void gin_complete_pending_ack_request(
-	nccl_ofi_gin_peer_rank_info &peer, uint32_t rx_consumed)
-{
-	if (peer.has_pending_ack_request) {
-		const uint32_t delta = gin_cursor_delta(rx_consumed,
-					       peer.last_ack_requested_seq);
-		if (delta != 0 && delta <= GIN_RX_CONSUMED_HALF) {
-			peer.has_pending_ack_request = false;
+	/* Clear the pending ACK request once an ACK's rx_consumed covers it.
+	   Backward or duplicate cursors (older, reordered ACKs) are ignored. */
+	inline void complete_pending_ack_request(uint32_t ack_rx_consumed)
+	{
+		if (has_pending_ack_request) {
+			const uint32_t delta =
+				gin_cursor_delta(ack_rx_consumed, last_ack_requested_seq);
+			if (delta != 0 && delta <= GIN_RX_CONSUMED_HALF) {
+				has_pending_ack_request = false;
+			}
 		}
 	}
-}
 
-static inline void gin_fill_ack_header(const nccl_ofi_gin_peer_rank_info &peer,
-			       uint32_t rx_consumed, gin_ack_msg &ack)
-{
-	ack = {};
-	ack.msg_type = GIN_MSG_TYPE_ACK;
-	ack.ack_comm_id = static_cast<uint16_t>(peer.comm_id);
-	ack.rx_consumed = rx_consumed & GIN_RX_CONSUMED_MASK;
-}
+	inline void fill_ack_header(uint32_t ack_rx_consumed, gin_ack_msg &ack) const
+	{
+		ack = {};
+		ack.msg_type = GIN_MSG_TYPE_ACK;
+		ack.ack_comm_id = static_cast<uint16_t>(comm_id);
+		ack.rx_consumed = ack_rx_consumed & GIN_RX_CONSUMED_MASK;
+	}
+
+	/* Apply a receiver-advertised grant to this sender window. A zero
+	   grant means an older/skewed peer did not advertise one; leave the
+	   window alone. Only an ACK that advanced tx_tail may widen the
+	   window: a reordered older ACK can carry a grant computed before the
+	   receiver's CQ budget shrank, so it may only shrink the window.
+	   Shrinking resets the ACK hysteresis counter so the next op can
+	   re-arm the ack_req gate under the smaller window. */
+	inline void apply_granted_window(uint32_t granted_window, bool is_newest_ack)
+	{
+		if (granted_window == 0) {
+			return;
+		}
+		const uint32_t old_limit = current_window_limit;
+		const uint32_t new_limit =
+			std::clamp<uint32_t>(granted_window, 1, gin_granted_window_get_max_limit());
+		if (!is_newest_ack && new_limit > old_limit) {
+			return;
+		}
+		current_window_limit = new_limit;
+		if (new_limit < old_limit) {
+			consecutive_puts_without_ack = 0;
+		}
+	}
+};
 
 struct gin_cq_sizing_diagnostics {
 	size_t configured_size;
@@ -478,36 +507,6 @@ struct gin_cq_sizing_diagnostics {
 static inline uint32_t gin_fanin_get_worst_case_peers(uint32_t nranks)
 {
 	return std::max<uint32_t>(1, nranks - 1);
-}
-
-static inline uint32_t gin_granted_window_get_max_limit()
-{
-	return std::min<uint32_t>(GIN_IMM_SEQ_MASK + 1, GIN_ACK_GRANT_MAX);
-}
-
-/* Apply a receiver-advertised grant to a peer's sender window. A zero grant
-   means an older/skewed peer did not advertise one; leave the window alone.
-   Only an ACK that advanced tx_tail may widen the window: a reordered older
-   ACK can carry a grant computed before the receiver's CQ budget shrank, so
-   it may only shrink the window. Shrinking resets the ACK hysteresis counter
-   so the next op can re-arm the ack_req gate under the smaller window. */
-static inline void gin_apply_granted_window(nccl_ofi_gin_peer_rank_info &peer,
-					    uint32_t granted_window,
-					    bool is_newest_ack)
-{
-	if (granted_window == 0) {
-		return;
-	}
-	const uint32_t old_limit = peer.current_window_limit;
-	const uint32_t new_limit =
-		std::clamp<uint32_t>(granted_window, 1, gin_granted_window_get_max_limit());
-	if (!is_newest_ack && new_limit > old_limit) {
-		return;
-	}
-	peer.current_window_limit = new_limit;
-	if (new_limit < old_limit) {
-		peer.consecutive_puts_without_ack = 0;
-	}
 }
 
 static inline size_t gin_rx_cq_get_reserve_entries(uint32_t peers, size_t reserve_margin)
@@ -581,7 +580,7 @@ static inline uint32_t gin_ack_request_get_threshold(uint32_t current_window_lim
 }
 
 static inline gin_cq_sizing_diagnostics
-gin_compute_cq_sizing_diagnostics(size_t cq_size_floor, uint32_t nranks, size_t reserve_margin)
+gin_cq_sizing_get_diagnostics(size_t cq_size_floor, uint32_t nranks, size_t reserve_margin)
 {
 	const size_t target_cq_size =
 		gin_target_cq_get_size(nranks, GIN_TARGET_GRANTED_WINDOW, reserve_margin);

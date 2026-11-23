@@ -127,9 +127,8 @@ nccl_ofi_rdma_gin_ep_t::nccl_ofi_rdma_gin_ep_t(nccl_net_ofi_domain_t &domain_arg
 		 * CXI-only auto-sizing heuristic. */
 		configured_rx_cq_size = cq_size_floor;
 	} else {
-		const auto cq_diagnostics =
-			gin_compute_cq_sizing_diagnostics(cq_size_floor, cq_sizing_nranks,
-						 rx_cq_reserve_margin);
+		const auto cq_diagnostics = gin_cq_sizing_get_diagnostics(
+			cq_size_floor, cq_sizing_nranks, rx_cq_reserve_margin);
 		configured_rx_cq_size = cq_diagnostics.configured_size;
 		cq_was_auto_sized = cq_diagnostics.was_auto_sized;
 		cq_was_auto_capped = cq_diagnostics.was_auto_capped;
@@ -579,7 +578,7 @@ static inline void get_gin_hints(struct fi_info &hints, struct fi_info *ref_info
 		nccl_ofi_translate_progress_enum(ofi_nccl_progress_model.get());
 
 	/* Endpoint-MR completions encode the sender rank in the upper 32 bits. */
-	hints.domain_attr->cq_data_size = gin_required_cq_data_size(
+	hints.domain_attr->cq_data_size = gin_cq_data_get_required_size(
 		(ref_info->domain_attr->mr_mode & FI_MR_ENDPOINT) != 0);
 
 	/* Copy domain and fabric names from previously opened net transport.

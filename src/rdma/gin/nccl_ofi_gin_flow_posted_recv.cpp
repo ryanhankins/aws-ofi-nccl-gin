@@ -42,7 +42,7 @@ void gin_flow_posted_recv::prepare_ack(
 	const nccl_ofi_gin_peer_rank_info &peer,
 	uint32_t rx_consumed, gin_ack_msg &ack)
 {
-	gin_fill_ack_header(peer, rx_consumed, ack);
+	peer.fill_ack_header(rx_consumed, ack);
 }
 
 void gin_flow_posted_recv::process_ack(nccl_ofi_gin_peer_rank_info &peer,
@@ -50,5 +50,5 @@ void gin_flow_posted_recv::process_ack(nccl_ofi_gin_peer_rank_info &peer,
 				       bool is_newest_ack)
 {
 	(void)is_newest_ack;
-	gin_complete_pending_ack_request(peer, ack.rx_consumed);
+	peer.complete_pending_ack_request(ack.rx_consumed);
 }
