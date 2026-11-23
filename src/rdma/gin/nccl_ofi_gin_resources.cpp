@@ -85,6 +85,29 @@ nccl_ofi_rdma_gin_ep_t::nccl_ofi_rdma_gin_ep_t(nccl_net_ofi_domain_t &domain_arg
 	 */
 	ofi_info_ptr gin_info(get_gin_info(domain.get_device()->get_ofi_info(0)));
 	uses_posted_recv_flow = gin_info->mode & FI_RX_CQ_DATA;
+
+	/*
+	 * GIN behavior is selected by three provider predicates:
+	 *  - endpoint_mr (NET provider requires FI_MR_ENDPOINT): MR binding,
+	 *    write-request type, sender-rank encoding and validation, and
+	 *    teardown order.
+	 *  - uses_posted_recv_flow (negotiated FI_RX_CQ_DATA): completion
+	 *    routing and the flow-control policy.
+	 *  - The reference info's FI_MR_ENDPOINT bit: GIN fi_getinfo hints.
+	 * get_gin_hints() requests FI_RX_CQ_DATA exactly when the reference
+	 * info lacks FI_MR_ENDPOINT, so all three must agree. Reject a
+	 * provider that negotiated otherwise instead of mixing completion
+	 * paths with the wrong rank encoding or teardown order.
+	 */
+	const bool gin_endpoint_mr = (gin_info->domain_attr->mr_mode & FI_MR_ENDPOINT) != 0;
+	if (gin_endpoint_mr != endpoint_mr || uses_posted_recv_flow == endpoint_mr) {
+		NCCL_OFI_WARN("Inconsistent GIN provider modes: endpoint_mr=%d "
+			      "gin FI_MR_ENDPOINT=%d FI_RX_CQ_DATA=%d",
+			      endpoint_mr,
+			      gin_endpoint_mr,
+			      uses_posted_recv_flow);
+		throw std::runtime_error("GIN provider modes are inconsistent");
+	}
 	if (uses_posted_recv_flow) {
 		process_completions_impl =
 			&nccl_ofi_rdma_gin_ep_t::gin_process_completions_posted_recv;

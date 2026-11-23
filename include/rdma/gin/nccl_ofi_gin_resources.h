@@ -158,6 +158,9 @@ public:
 	using write_req_factory = nccl_net_ofi_gin_write_req_t *(*)(
 		nccl_ofi_gin_resources &, const nccl_net_ofi_gin_write_req_t::args &);
 	const write_req_factory make_write_req;
+
+	/* Negotiated FI_RX_CQ_DATA. The constructor enforces that this is
+	 * exactly !endpoint_mr; see the comment there. */
 	bool get_uses_posted_recv_flow() const
 	{
 		return uses_posted_recv_flow;
