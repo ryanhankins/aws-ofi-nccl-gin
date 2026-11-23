@@ -308,7 +308,10 @@ ncclResult_t nccl_ofi_gin_closeColl(void *collComm)
 
 	if (endpoint_mr) {
 		/* Proxy threads have stopped. Keep progressing until every peer has
-		   drained its ACK requests, including ranks with no requests of their own. */
+		   drained its ACK requests, including ranks with no requests of their own.
+		   This is a collective barrier: like NCCL's own comm teardown, closeColl
+		   must be called by every rank of the comm. A rank that skips it leaves
+		   the others waiting here until the comm's abort flag is set. */
 		std::vector<char> arrived(gin_comm->get_nranks(), 0);
 		ret = gin_comm->get_ag_comm().all_gather(arrived.data(), 1, [&]() {
 			std::lock_guard<std::mutex> lock(gin_comm->get_ep_lock());

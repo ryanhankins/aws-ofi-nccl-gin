@@ -526,7 +526,7 @@ int nccl_ofi_rdma_gin_put_comm::regMrSymDmaBufCommon(nccl_ofi_mr_ckey_ref ckey, 
 	 * Symmetric registration is collective, so every rank must reach this
 	 * all-gather
 	 */
-	ret = ag_comm.all_gather(mr_handle->remote_mr.data(), sizeof(gin_remote_mr));
+	ret = ag_comm.all_gather(mr_handle->remote_mr.data(), sizeof(gin_remote_mr), nullptr);
 	if (ret != 0) {
 		int dereg_ret = deregMrSymLocked(mr_handle);
 		if (dereg_ret != 0) {

@@ -52,9 +52,11 @@ public:
 };
 
 template <typename ProgressFn, typename RequestsActiveFn, typename PollFn>
-int nccl_ofi_gin_drain_all_gather_requests(
-	nccl_ofi_gin_deferred_progress_error &progress_error, ProgressFn &&progress,
-	RequestsActiveFn &&requests_active, PollFn &&poll, nccl_ofi_gin_abort_token abort = {})
+int nccl_ofi_gin_drain_all_gather_requests(nccl_ofi_gin_deferred_progress_error &progress_error,
+					   ProgressFn &&progress,
+					   RequestsActiveFn &&requests_active,
+					   PollFn &&poll,
+					   nccl_ofi_gin_abort_token abort)
 {
 	while (requests_active()) {
 		if (OFI_UNLIKELY(abort.requested())) {
@@ -97,8 +99,10 @@ private:
 
 public:
 	nccl_ofi_gin_allgather_comm(nccl_ofi_gin_ring_send_comm s_comm_arg,
-				    nccl_ofi_gin_ring_recv_comm r_comm_arg, size_t rank_arg,
-				    size_t nranks_arg, nccl_ofi_gin_abort_token abort_arg = {})
+				    nccl_ofi_gin_ring_recv_comm r_comm_arg,
+				    size_t rank_arg,
+				    size_t nranks_arg,
+				    nccl_ofi_gin_abort_token abort_arg)
 	    : s_comm(std::move(s_comm_arg)), r_comm(std::move(r_comm_arg)), rank(rank_arg),
 	      nranks(nranks_arg), abort(abort_arg)
 	{
@@ -109,13 +113,14 @@ public:
 	 *
 	 * @param data: a buffer of size (size * nranks) bytes
 	 * @param size: the size of each data element in bytes
-	 * @param progress: optional progress callback; errors are deferred until
-	 *                  posted requests complete and the buffer MRs are deregistered
+	 * @param progress: progress callback, or empty for none; errors are deferred
+	 *                  until posted requests complete and the buffer MRs are
+	 *                  deregistered
 	 *
 	 * @return: 0 on success, -ECANCELED if the communicator aborted while
 	 *          waiting, -errno on failure
 	 */
-	int all_gather(void *data, size_t size, std::function<int()> progress = {});
+	int all_gather(void *data, size_t size, std::function<int()> progress);
 
 	nccl_ofi_gin_abort_token get_abort_token() const
 	{

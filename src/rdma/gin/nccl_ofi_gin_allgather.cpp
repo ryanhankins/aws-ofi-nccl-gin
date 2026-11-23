@@ -22,7 +22,8 @@ void nccl_ofi_gin_ring_comm_closer::operator()(nccl_net_ofi_recv_comm *comm) con
 	}
 }
 
-void nccl_ofi_gin_allgather_comm::mr_deregistrar::operator()(nccl_net_ofi_mr_handle_t *mhandle) const
+void nccl_ofi_gin_allgather_comm::mr_deregistrar::operator()(
+	nccl_net_ofi_mr_handle_t *mhandle) const
 {
 	if (OFI_UNLIKELY(nccl_net_ofi_deregMr(comm, mhandle) != ncclSuccess)) {
 		NCCL_OFI_WARN("bootstrap allgather dereg failed");
@@ -138,18 +139,19 @@ int nccl_ofi_gin_allgather_comm::all_gather(void *data, size_t size,
 			}, abort);
 		if (ret != 0) {
 			if (ret == -ECANCELED) {
-				NCCL_OFI_WARN("bootstrap allgather aborted while waiting (step %zu/%zu)",
-					      i, nranks - 1);
+				NCCL_OFI_WARN("bootstrap allgather aborted while waiting "
+					      "(step %zu/%zu)",
+					      i,
+					      nranks - 1);
 			}
 			return ret;
 		}
 		if (progress_error.failed()) {
-			goto deregister;
+			break;
 		}
 		srank = rrank;
 	}
 
-deregister:
 	ret = nccl_net_ofi_deregMr(s_comm.get(), smhandle_guard.release());
 	if (ret != ncclSuccess) {
 		NCCL_OFI_WARN("bootstrap allgather send dereg failed");

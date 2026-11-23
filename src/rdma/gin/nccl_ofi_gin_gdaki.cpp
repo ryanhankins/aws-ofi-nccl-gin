@@ -183,7 +183,7 @@ static ncclResult_t nccl_ofi_gin_gdaki_get_properties(int dev, ncclNetProperties
 static void gdaki_setup_allgather(nccl_ofi_rdma_gin_put_comm *put_comm, void *data, size_t size,
 				  const std::string &what)
 {
-	int ret = put_comm->get_ag_comm().all_gather(data, size);
+	int ret = put_comm->get_ag_comm().all_gather(data, size, nullptr);
 	if (OFI_UNLIKELY(ret == -ECANCELED)) {
 		throw std::runtime_error("communicator aborted during " + what);
 	}
