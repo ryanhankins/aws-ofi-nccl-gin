@@ -473,6 +473,28 @@ ofi_mr_result nccl_ofi_ofiutils_mr_regattr(ofi_domain_ptr &domain,
 	return ofi_mr_result(make_ofi_mr_ptr(raw_mr));
 }
 
+int nccl_ofi_ofiutils_mr_bind_and_enable(struct fid_mr *mr,
+					 struct fid_ep *ofi_ep,
+					 uint16_t rail_id,
+					 const char *rail_type)
+{
+	int ret = fi_mr_bind(mr, &ofi_ep->fid, 0);
+	if (ret != 0) {
+		NCCL_OFI_WARN("fi_mr_bind (%s rail %u) failed: rc=%d, error=%s",
+			      rail_type, rail_id, ret, fi_strerror(-ret));
+		return ret;
+	}
+
+	ret = fi_mr_enable(mr);
+	if (ret != 0) {
+		NCCL_OFI_WARN("fi_mr_enable failed on %s rail %u with rc=%d, error=%s",
+			      rail_type, rail_id, ret, fi_strerror(-ret));
+		return ret;
+	}
+
+	return 0;
+}
+
 
 /**
  * @brief	Release libfabric endpoint, address vector

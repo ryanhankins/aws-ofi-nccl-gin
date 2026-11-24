@@ -114,6 +114,14 @@ OFI_NCCL_PARAM(size_t, gin_cq_process_max_iter, "GIN_CQ_PROCESS_MAX_ITER", 4);
 OFI_NCCL_PARAM(size_t, cq_size, "CQ_SIZE", 12288);
 
 /*
+ * Extra CQ entries reserved for ACKs, metadata, and other non-payload RX work
+ * on GIN writedata-routed providers. The per-peer write budget is derived
+ * from CQ size, but this control-traffic allowance is a heuristic, so it is
+ * tunable for provider configurations whose control completions differ.
+ */
+OFI_NCCL_PARAM(size_t, gin_rx_cq_reserve_margin, "GIN_RX_CQ_RESERVE_MARGIN", 288);
+
+/*
  * Protocol to use for send/recv operations.  Valid options are
  * SENDRECV and RDMA.
  */

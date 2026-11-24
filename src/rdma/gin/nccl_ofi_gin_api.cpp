@@ -6,7 +6,8 @@
 
 #include <atomic>
 #include <cstring>
-#include <thread>
+#include <mutex>
+#include <vector>
 
 #include "rdma/gin/nccl_ofi_gin.h"
 #include "rdma/gin/nccl_ofi_gin_api.h"
@@ -51,11 +52,9 @@ ncclResult_t nccl_ofi_gin_init(void **ctx, uint64_t commId, ncclDebugLogger_t lo
 		return ncclInternalError;
 	}
 
-	/* We make the global MR assumption in various places. */
-	if (endpoint_mr) {
-		NCCL_OFI_WARN("GIN plugin does not support FI_MR_ENDPOINT");
-		return ncclInternalError;
-	}
+	/* Providers that require FI_MR_ENDPOINT (e.g. CXI) have each MR bound to
+	   the GIN endpoint of the rail it was registered on; see
+	   nccl_ofi_rdma_gin_ep_t::reg_mr. */
 
 	/* GDR copy context is now a singleton, lazily initialized on first use.
 	 * GIN requires GDRCopy 2.5+ for forced PCIe copy support. */
@@ -143,20 +142,13 @@ ncclResult_t nccl_ofi_gin_listen(void *ctx, int dev, void *handle, void **listen
 		return ncclInternalError;
 	}
 
-	/* Bucket connections across endpoints by their owning GIN progress
-	   thread, so each progress thread drives its own endpoint instead of
-	   contending on a shared completion queue.
-
-	   NCCL calls listen() ginCommCount times (once per collComm).
-	   listen_seq % NCCL_GIN_PROXY_NTHREADS maps each connection to its
-	   owning thread's endpoint:
-	   - When ginCommCount == NTHREADS (typical): each listen gets a unique
-	     thread_idx, yielding one dedicated EP per thread.
-	   - When ginCommCount > NTHREADS: multiple connections share an EP
-	     (thread t round-robins connections t, t+T, t+2T, ... and they all
-	     land on the same endpoint_key).
-	   - NCCL_GIN_PROXY_NTHREADS=1 (default): all connections share the
-	     single per-init seq endpoint (legacy behavior). */
+	/* Keep plugin endpoint bucketing aligned with NCCL's proxy ownership:
+	   nccl/src/gin/gin_host.cc drives commIdx t, t+proxyNthreads, ... on
+	   proxy thread t, and listen() is called once per commIdx in that same
+	   sequence. Because both sides key off NCCL_GIN_PROXY_NTHREADS, this
+	   listen_seq % nthreads bucket must stay in lock-step with NCCL's
+	   commIdx % proxyNthreads partitioning or shared-endpoint flow-control
+	   state will corrupt silently. */
 	const int listen_seq = context->listen_count++;
 	int thread_idx = listen_seq % context->nthreads;
 
@@ -310,6 +302,22 @@ ncclResult_t nccl_ofi_gin_closeColl(void *collComm)
 	int ret = gin_comm->await_pending_requests();
 	if (OFI_UNLIKELY(ret != 0)) {
 		return nccl_net_ofi_retval_translate(ret);
+	}
+
+	if (endpoint_mr) {
+		/* Proxy threads have stopped. Keep progressing until every peer has
+		   drained its ACK requests, including ranks with no requests of their own.
+		   This is a collective barrier: like NCCL's own comm teardown, closeColl
+		   must be called by every rank of the comm. A rank that skips it leaves
+		   the others waiting here until the comm's abort flag is set. */
+		std::vector<char> arrived(gin_comm->get_nranks(), 0);
+		ret = gin_comm->get_ag_comm().all_gather(arrived.data(), 1, [&]() {
+			std::lock_guard<std::mutex> lock(gin_comm->get_ep_lock());
+			return gin_comm->get_resources().progress();
+		});
+		if (OFI_UNLIKELY(ret != 0)) {
+			return nccl_net_ofi_retval_translate(ret);
+		}
 	}
 
 	/* Phase 1 — quiesce the shared gdrcopy worker for this comm. The worker

@@ -22,17 +22,20 @@ void nccl_ofi_gin_ring_comm_closer::operator()(nccl_net_ofi_recv_comm *comm) con
 	}
 }
 
-void nccl_ofi_gin_allgather_comm::mr_deregistrar::operator()(nccl_net_ofi_mr_handle_t *mhandle) const
+void nccl_ofi_gin_allgather_comm::mr_deregistrar::operator()(
+	nccl_net_ofi_mr_handle_t *mhandle) const
 {
 	if (OFI_UNLIKELY(nccl_net_ofi_deregMr(comm, mhandle) != ncclSuccess)) {
 		NCCL_OFI_WARN("bootstrap allgather dereg failed");
 	}
 }
 
-int nccl_ofi_gin_allgather_comm::all_gather(void *data, size_t size)
+int nccl_ofi_gin_allgather_comm::all_gather(void *data, size_t size,
+					    std::function<int()> progress)
 {
 	nccl_net_ofi_mr_handle_t *rmhandle = nullptr, *smhandle = nullptr;
 	nccl_net_ofi_req *rreq = nullptr, *sreq = nullptr;
+	nccl_ofi_gin_deferred_progress_error progress_error;
 	int srank, rrank;
 	int done, req_size, tag;
 	void *buf = NULL;
@@ -74,12 +77,18 @@ int nccl_ofi_gin_allgather_comm::all_gather(void *data, size_t size)
 				return -ECANCELED;
 			}
 
+			if (progress) {
+				progress_error.run(progress);
+			}
 			if (!rreq) {
 				buf = ((char *)data) + (rrank * size);
 				ret = r_comm->recv(1, &buf, &size, &tag, &rmhandle, &rreq);
 				if (OFI_UNLIKELY(ret != 0)) {
 					NCCL_OFI_WARN("bootstrap allgather irecv failed");
-					return ret;
+					if (!progress_error.failed()) {
+						return ret;
+					}
+					continue;
 				}
 			}
 
@@ -88,45 +97,76 @@ int nccl_ofi_gin_allgather_comm::all_gather(void *data, size_t size)
 				ret = s_comm->send(buf, size, tag, smhandle, &sreq);
 				if (OFI_UNLIKELY(ret != 0)) {
 					NCCL_OFI_WARN("bootstrap allgather isend failed");
-					return ret;
+					if (!progress_error.failed()) {
+						return ret;
+					}
+					continue;
 				}
 			}
 		}
 
-		while (rreq || sreq) {
-			if (OFI_UNLIKELY(abort.requested())) {
-				NCCL_OFI_WARN("bootstrap allgather aborted while waiting (step %zu/%zu)",
-					      i, nranks - 1);
-				return -ECANCELED;
+		ret = nccl_ofi_gin_drain_all_gather_requests(
+			progress_error, progress, [&]() { return rreq || sreq; }, [&]() {
+				done = 0;
+				req_size = 0;
+				if (rreq) {
+					ret = rreq->test(&done, &req_size);
+					if (OFI_UNLIKELY(ret != 0)) {
+						NCCL_OFI_WARN("bootstrap allgather test failed");
+						if (!progress_error.failed()) {
+							return ret;
+						}
+					}
+					if (done) {
+						done = 0;
+						rreq = nullptr;
+					}
+				}
+				if (sreq) {
+					ret = sreq->test(&done, &req_size);
+					if (OFI_UNLIKELY(ret != 0)) {
+						NCCL_OFI_WARN("bootstrap allgather test failed");
+						if (!progress_error.failed()) {
+							return ret;
+						}
+					}
+					if (done) {
+						done = 0;
+						sreq = nullptr;
+					}
+				}
+				return 0;
+			}, abort);
+		if (ret != 0) {
+			if (ret == -ECANCELED) {
+				NCCL_OFI_WARN("bootstrap allgather aborted while waiting "
+					      "(step %zu/%zu)",
+					      i,
+					      nranks - 1);
 			}
-
-			done = 0;
-			req_size = 0;
-			if (rreq) {
-				ret = rreq->test(&done, &req_size);
-				if (OFI_UNLIKELY(ret != 0)) {
-					NCCL_OFI_WARN("bootstrap allgather test failed");
-					return ret;
-				}
-				if (done) {
-					done = 0;
-					rreq = NULL;
-				}
-			}
-			if (sreq) {
-				ret = sreq->test(&done, &req_size);
-				if (OFI_UNLIKELY(ret != 0)) {
-					NCCL_OFI_WARN("bootstrap allgather test failed");
-					return ret;
-				}
-				if (done) {
-					done = 0;
-					sreq = NULL;
-				}
-			}
+			return ret;
+		}
+		if (progress_error.failed()) {
+			break;
 		}
 		srank = rrank;
 	}
 
-	return ret;
+	ret = nccl_net_ofi_deregMr(s_comm.get(), smhandle_guard.release());
+	if (ret != ncclSuccess) {
+		NCCL_OFI_WARN("bootstrap allgather send dereg failed");
+		ret = -EIO;
+	} else {
+		ret = 0;
+	}
+
+	int recv_dereg_ret = nccl_net_ofi_deregMr(r_comm.get(), rmhandle_guard.release());
+	if (recv_dereg_ret != ncclSuccess) {
+		NCCL_OFI_WARN("bootstrap allgather recv dereg failed");
+		if (ret == 0) {
+			ret = -EIO;
+		}
+	}
+
+	return progress_error.result(ret);
 }
